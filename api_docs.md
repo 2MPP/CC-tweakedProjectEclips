@@ -99,8 +99,37 @@ Lists every hardware node discovered on the MCP cable and wireless extender netw
 ### `mcp.disconnectNode(nodeId)`
 Disconnects a specific node from the MCP network.
 - **Parameters:**
-  - `nodeId` *(number)* — Node ID from `mcp.getNodes()` or `mcp.getLaunchers()`.
+  - `nodeId` *(string)* — Node UUID from `mcp.getNodes()` or `mcp.getLaunchers()`.
 - **Returns:** `boolean` (`true` if disconnected)
+
+### `mcp.registerRocket(x, y, z [, name])` / `mcp.registerDevice(x, y, z [, name])` *(Requires `OWNER`)*
+Programmatically registers/links a rocket, placed missile, four-rail pod launcher, launch pad, Strategic "Big One" silo, cruise missile trailer (including any unlinked cruise missiles inside its boxes), 4-rack interceptor launcher, radar, CIWS, wireless extender, UAV pad, or silo door at `(x, y, z)` to this MCP network. You can pass the coordinates of either the launcher/pad or the rocket standing on top of it.
+- **Parameters:**
+  - `x`, `y`, `z` *(number)* — World coordinates of the rocket or launcher.
+  - `name` *(string, optional)* — Custom label to assign to the registered node.
+- **Returns:** `table`
+  | Field | Type | Description |
+  |---|---|---|
+  | `registered` | `boolean` | `true` if linked (or already registered to this MCP) |
+  | `id` | `string` | Registered node UUID |
+  | `type` | `string` | Node type (`"PLACED_MISSILE"`, `"ATTACK_LAUNCHER"`, `"LAUNCH_PAD"`, `"STRATEGIC_SILO"`, `"CRUISE_LAUNCHER"`, `"INTERCEPTOR_LAUNCHER"`, etc.) |
+  | `label` | `string` | Human-readable device category |
+  | `x`, `y`, `z` | `number` | Resolved controller coordinates |
+  | `linkedCruiseMissiles` | `number` | Number of individual cruise missiles inside trailer boxes that were also linked |
+  | `message` | `string` | `"REGISTERED"`, `"ALREADY REGISTERED"`, or failure reason |
+
+### `mcp.scanAndRegister([radius])` *(Requires `OWNER`)*
+Scans within `radius` blocks around the MCP (and across any Sable physics vehicle the MCP is mounted on) and automatically registers all unlinked rockets, placed missiles, launchers, pads, silos, cruise trailers, radars, and air-defense devices.
+- **Parameters:**
+  - `radius` *(number, optional)* — Scan radius in blocks (`1`–`64`, default `16`).
+- **Returns:** `{ count = number, radius = number, registered = table[] }`
+
+### `mcp.renameNode(nodeId, name)` *(Requires `OWNER`)*
+Assigns or updates the custom display name of any registered rocket, launcher, or node on this MCP network.
+- **Parameters:**
+  - `nodeId` *(string)* — Node UUID from `mcp.getNodes()` or `mcp.getLaunchers()`.
+  - `name` *(string)* — New display name (pass `""` to clear).
+- **Returns:** `boolean` (`true` if updated)
 
 ### `mcp.getEvents([limit])`
 Returns recent entries from the MCP activity log.
@@ -392,7 +421,83 @@ Launches a reconnaissance UAV from a connected UAV Pad toward the specified targ
 
 ---
 
-## 9. Complete Lua Examples
+## 9. Orbital Recon Satellites & Project Thor Kinetic Strikes
+
+Programmatic access to in-orbit space assets deployed via Strategic Silos ("The Big One").
+
+### `mcp.getSatellites()`
+Returns a list of all active Recon Satellites in orbit belonging to this defense network.
+- **Returns:** `table[]` of:
+  - `id`: `string`
+  - `owner`: `string`
+  - `orbitX`: `number`
+  - `orbitY`: `number`
+  - `orbitZ`: `number`
+  - `deployedTick`: `number`
+
+### `mcp.hasReconSatellites()`
+Returns whether this network currently has at least one active recon satellite in orbit.
+- **Returns:** `boolean`
+
+### `mcp.getThorStatus()`
+Returns the operational status of Project Thor orbital kinetic platforms for this network.
+- **Returns:** `{ online = boolean, rodsRemaining = number }`
+
+### `mcp.getRemainingTungstenRods()`
+Returns the total count of heavy tungsten penetrator rods ready to drop from orbit.
+- **Returns:** `number`
+
+### `mcp.fireOrbitalStrike(x, z [, y])` *(Requires `OPERATOR`)*
+Dispatches a hypersonic kinetic strike from an in-orbit Thor platform straight down onto the target coordinates. Takes ~3.5 seconds to impact and bores through 30+ blocks of subterranean bunkers.
+- **Parameters:**
+  - `x`: `number` — Target X coordinate
+  - `z`: `number` — Target Z coordinate
+  - `y` *(number, optional)* — Ground/target elevation (defaults to surface height)
+- **Returns:** `{ status = "DISPATCHED", targetX = number, targetY = number, targetZ = number, flightSeconds = 3.5, remainingRods = number }`
+
+---
+
+## 10. Electronic Warfare & Radar Jamming
+
+Control standalone or networked Radar Jammer stations.
+
+### Standalone Peripheral: `radar_jammer`
+Place a computer adjacent to a Radar Jammer Station or connect via wired modem:
+
+```lua
+local jammer = peripheral.find("radar_jammer")
+assert(jammer, "No Radar Jammer found!")
+
+-- Check status
+print("Active:", jammer.isActive())
+print("Mode:", jammer.getMode()) -- "noise" or "deception"
+print("Range:", jammer.getRange())
+
+-- Switch mode to deception spoofing
+jammer.setMode("deception")
+
+-- Toggle power
+jammer.setActive(true)
+```
+
+#### Methods on `radar_jammer`:
+- `jammer.isActive()`: Returns `boolean`.
+- `jammer.setActive(boolean)`: Enables or disables the jammer.
+- `jammer.toggle()`: Toggles active state. Returns new `boolean` state.
+- `jammer.getMode()`: Returns `"noise"` (range denial) or `"deception"` (ghost spoofing).
+- `jammer.setMode("noise" | "deception")`: Sets operational EW mode.
+- `jammer.cycleMode()`: Toggles mode. Returns new mode string.
+- `jammer.getRange()`: Returns effective broadcast radius (`160` for noise, `240` for deception).
+- `jammer.getInfo()`: Returns `{ active, mode, range, x, y, z, networkId, linkedMcp }`.
+
+### MCP Network Control Methods:
+- `mcp.getRadarJammers()`: Returns a list of all Radar Jammers linked to this MCP network: `table[]` of `{ x, y, z, active, mode, range }`.
+- `mcp.setRadarJammerActive(x, y, z, active)`: Remotely activates or deactivates a network jammer.
+- `mcp.setRadarJammerMode(x, y, z, "noise" | "deception")`: Remotely sets the operational mode of a network jammer.
+
+---
+
+## 11. Complete Lua Examples
 
 ### Example 1: Multi-Target Salvo with Auto Load-Balancing
 ```lua
@@ -460,5 +565,29 @@ while true do
         mcp.engageThreat()
     end
     sleep(1)
+end
+```
+
+### Example 4: Orbital Recon & Automated Project Thor Kinetic Strike
+```lua
+local mcp = peripheral.find("missile_control_panel")
+assert(mcp and mcp.isAuthenticated(), "MCP not ready")
+
+-- Check space assets
+local sats = mcp.getSatellites()
+print(("Active Recon Satellites in orbit: %d"):format(#sats))
+
+local thor = mcp.getThorStatus()
+print(("Project Thor Online: %s (Rods remaining: %d)"):format(tostring(thor.online), thor.rodsRemaining))
+
+-- Automatically drop a hypersonic tungsten rod when a hostile contact enters range
+local contacts = mcp.getContacts()
+for _, c in ipairs(contacts) do
+    if c.tier >= 4 and thor.rodsRemaining > 0 then
+        print(("CALLING ORBITAL STRIKE ON CONTACT %s AT (%d, %d)"):format(c.flightId, c.x, c.z))
+        local strike = mcp.fireOrbitalStrike(c.x, c.z)
+        print(("Hypersonic impact in %.1f seconds!"):format(strike.flightSeconds))
+        break
+    end
 end
 ```
