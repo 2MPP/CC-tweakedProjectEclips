@@ -1,17 +1,13 @@
 -- Project Eclipse - Unified Radar, CIWS Defense, Audio & Encrypted Strike Server (CC:Tweaked)
--- Automatically pairs your main Radar Monitor + 4x2 Touch Keypad Monitor + speaker_0 + Wireless Modem.
--- Includes:
---   * Top Tab Bar on both monitors: [1:RDR] [2:STRK] [3:DEF] to switch screens anytime
---   * One-tap [DEFENSE: ON / OFF] button to disable/enable CIWS & interceptors
---   * Rich speaker_0 sound effects (radar sonar pings, missile klaxon, CIWS burst, launch audio, UI clicks)
---   * Clean zero-overlap layout for both the upright radar monitor and 4x2 (39x12) keypad deck
+-- Uses parallel.waitForAny so main-thread MCP peripheral calls NEVER drop monitor_touch,
+-- key, or wireless modem events!
 
 local CHANNEL        = 4920
 local PROTOCOL       = "ECLIPSE_ENC_V2"
 local KEY_FILE       = ".eclipse_key"
 local DEFAULT_KEY    = "ECLIPSE-77"
 local DEFAULT_RANGE  = 500
-local POLL_INTERVAL  = 0.20
+local POLL_INTERVAL  = 0.35
 local ZONE_RADIUS    = 512
 local DEFAULT_SPREAD = 16
 
@@ -128,7 +124,7 @@ local function decryptPacket(wrapper)
     if seenNonces[wrapper.nonce] then
         return nil, "Replay rejected"
     end
-    local expectedMac = computeMac(SECRET_KEY, Wrapper and Wrapper.nonce or wrapper.nonce, wrapper.cipher)
+    local expectedMac = computeMac(SECRET_KEY, wrapper.nonce, wrapper.cipher)
     if expectedMac ~= wrapper.mac then
         return nil, "Auth MAC mismatch (wrong key)"
     end
@@ -151,62 +147,54 @@ local function decryptPacket(wrapper)
 end
 
 --------------------------------------------------------------------------------
--- 2. Speaker Audio Engine (speaker_0)
+-- 2. Speaker Audio Engine (speaker_0) - Queued so it never blocks UI touch
 --------------------------------------------------------------------------------
 local speaker = peripheral.wrap("speaker_0") or peripheral.find("speaker")
 local soundEnabled = true
+local sfxQueue = {}
 
-local function sfxClick()
+local function queueSfx(kind, arg)
     if not speaker or not soundEnabled then return end
-    pcall(speaker.playNote, "hat", 0.7, 18)
-end
-
-local function sfxKey()
-    if not speaker or not soundEnabled then return end
-    pcall(speaker.playNote, "bit", 0.6, 14)
-end
-
-local function sfxPing(hasThreats)
-    if not speaker or not soundEnabled then return end
-    if hasThreats then
-        pcall(speaker.playNote, "pling", 0.8, 16)
-    else
-        pcall(speaker.playNote, "bit", 0.15, 6)
+    if #sfxQueue < 6 then
+        table.insert(sfxQueue, { kind = kind, arg = arg })
     end
 end
 
-local function sfxAlertKlaxon(highTone)
-    if not speaker or not soundEnabled then return end
-    pcall(speaker.playNote, "didgeridoo", 1.5, highTone and 10 or 6)
-    pcall(speaker.playNote, "bell", 1.0, highTone and 14 or 10)
-end
-
-local function sfxCiwsBurst()
-    if not speaker or not soundEnabled then return end
-    pcall(speaker.playSound, "entity.generic.explode", 0.35, 1.8)
-    pcall(speaker.playNote, "snare", 0.9, 20)
-end
-
-local function sfxLaunch()
-    if not speaker or not soundEnabled then return end
-    pcall(speaker.playSound, "entity.firework_rocket.launch", 2.0, 0.7)
-    pcall(speaker.playNote, "chime", 1.5, 12)
-end
-
-local function sfxDefenseToggle(enabled)
-    if not speaker or not soundEnabled then return end
-    if enabled then
-        pcall(speaker.playNote, "pling", 1.0, 12)
-        pcall(speaker.playNote, "pling", 1.0, 18)
-    else
-        pcall(speaker.playNote, "bass", 1.0, 10)
-        pcall(speaker.playNote, "bass", 1.0, 4)
+local function flushSfxQueue()
+    if not speaker or #sfxQueue == 0 then return end
+    local item = table.remove(sfxQueue, 1)
+    if not soundEnabled then return end
+    local k = item.kind
+    if k == "click" then
+        pcall(speaker.playNote, "hat", 0.8, 18)
+    elseif k == "key" then
+        pcall(speaker.playNote, "bit", 0.7, 14)
+    elseif k == "ping" then
+        if item.arg then
+            pcall(speaker.playNote, "pling", 0.9, 16)
+        else
+            pcall(speaker.playNote, "bit", 0.15, 6)
+        end
+    elseif k == "klaxon" then
+        pcall(speaker.playNote, "didgeridoo", 1.5, item.arg and 10 or 6)
+        pcall(speaker.playNote, "bell", 1.0, item.arg and 14 or 10)
+    elseif k == "ciws" then
+        pcall(speaker.playSound, "entity.generic.explode", 0.35, 1.8)
+        pcall(speaker.playNote, "snare", 0.9, 20)
+    elseif k == "launch" then
+        pcall(speaker.playSound, "entity.firework_rocket.launch", 2.0, 0.7)
+        pcall(speaker.playNote, "chime", 1.5, 12)
+    elseif k == "def" then
+        if item.arg then
+            pcall(speaker.playNote, "pling", 1.0, 16)
+        else
+            pcall(speaker.playNote, "bass", 1.0, 5)
+        end
     end
 end
 
 --------------------------------------------------------------------------------
 -- 3. Peripheral Discovery (Monitors, MCP, Wireless Modem)
--- Automatically picks the taller monitor as Main Radar and shorter (4x2) as Keypad Deck
 --------------------------------------------------------------------------------
 local allMonitors = {}
 for _, name in ipairs(peripheral.getNames()) do
@@ -224,7 +212,7 @@ if #allMonitors == 0 then
     error("No connected monitors found!")
 end
 
--- Sort so the tallest/largest monitor is primary (mon) and the second is the 4x2 keypad (keyMon)
+-- Tallest/largest monitor is Main Radar (mon); second monitor is 4x2 Keypad Deck (keyMon)
 table.sort(allMonitors, function(a, b)
     if a.h ~= b.h then return a.h > b.h end
     return a.area > b.area
@@ -237,7 +225,6 @@ local W, H       = mon.getSize()
 local keyMon     = allMonitors[2] and allMonitors[2].mon or nil
 local keyMonName = allMonitors[2] and allMonitors[2].name or nil
 
--- Wireless / Ender Modem
 local modem = peripheral.find("modem", function(_, m)
     return m.isWireless and m.isWireless()
 end)
@@ -245,7 +232,6 @@ if modem then
     modem.open(CHANNEL)
 end
 
--- Missile Control Panel
 local mcp = peripheral.find("missile_control_panel")
 if not mcp then
     error("No Missile Control Panel (missile_control_panel) found!")
@@ -281,11 +267,68 @@ end
 ensureAuthenticated()
 
 --------------------------------------------------------------------------------
--- 4. Air Defense Toggle, Auto-Registration & Dispersed Launch Logic
+-- 4. Shared State & Non-Blocking Action Queue
 --------------------------------------------------------------------------------
 local defenseEnabled = true
+local actionQueue = {} -- Queued MCP actions so touch handlers never block!
 
-local function applyDefenseState(enabled, centerX, centerZ)
+local FIRE_MODES = { "AUTO", "1", "2", "3", "4", "5", "6", "BIG_ONE", "CRUISE", "SALVO", "THOR" }
+local PROFILES   = { "HIGH_BALLISTIC", "LOW_TRAJECTORY", "TERRAIN_HUG" }
+local IMPACTS    = { "SURFACE", "AIRBURST", "BUNKER_BUSTER" }
+
+local strikeCfg = {
+    targetX = 0,
+    targetY = 64,
+    targetZ = 0,
+    count = 4,
+    spread = DEFAULT_SPREAD,
+    modeIdx = 1,
+    profileIdx = 1,
+    impactIdx = 1,
+    mainWindow = "RADAR", -- "RADAR", "STRIKE", or "DEFENSE"
+    activeInputField = "X", -- "X", "Y", "Z", "CNT", "SPR"
+    inputBuffer = "",
+    lastStatus = "Ready - Right-click any button",
+}
+
+local state = {
+    online = true,
+    empTicks = 0,
+    originX = 0,
+    originY = 64,
+    originZ = 0,
+    radarRange = DEFAULT_RANGE,
+    radarCount = 0,
+    defenseMode = "AUTO",
+    readyCiws = 0,
+    ciwsAmmo = 0,
+    readyInterceptors = 0,
+    launcherCount = 0,
+    readyMissiles = 0,
+    placedCount = 0,
+    siloReady = 0,
+    thorRods = 0,
+    satCount = 0,
+    ciwsNodes = {},
+    blips = {},
+    threatList = {},
+    threatCount = 0,
+    trackCount = 0,
+    flightCount = 0,
+    engaging = false,
+    targetInitialized = false,
+    defenseInitialized = false,
+}
+
+local function queueAction(actTable)
+    table.insert(actionQueue, actTable)
+    os.queueEvent("eclipse_action")
+end
+
+--------------------------------------------------------------------------------
+-- 5. MCP Operations (Run inside mcpWorkerLoop coroutine)
+--------------------------------------------------------------------------------
+local function applyDefenseStateNow(enabled, centerX, centerZ)
     defenseEnabled = enabled
     if enabled then
         pcall(mcp.setDefenseMode, "AUTO")
@@ -307,7 +350,6 @@ local function applyDefenseState(enabled, centerX, centerZ)
         pcall(mcp.setDefenseMode, "HOLD_FIRE")
         pcall(mcp.setPursuitAuto, false)
         pcall(mcp.setDefenseZoneAutoEngage, "CIWS Defense Zone", false)
-        -- Also disable autoEngage on any other configured defense zones while defense is OFF
         local okZ, zones = pcall(mcp.getDefenseZones)
         if okZ and type(zones) == "table" then
             for _, z in ipairs(zones) do
@@ -317,7 +359,7 @@ local function applyDefenseState(enabled, centerX, centerZ)
     end
 end
 
-local function scanAndRegisterDevices(radius)
+local function scanAndRegisterDevicesNow(radius)
     radius = max(1, min(64, tonumber(radius) or 64))
     if not mcp.scanAndRegister then
         return false, "scanAndRegister unsupported"
@@ -328,27 +370,6 @@ local function scanAndRegisterDevices(radius)
     end
     return false, tostring(res or "Scan failed")
 end
-
-scanAndRegisterDevices(64)
-
-local FIRE_MODES = { "AUTO", "1", "2", "3", "4", "5", "6", "BIG_ONE", "CRUISE", "SALVO", "THOR" }
-local PROFILES   = { "HIGH_BALLISTIC", "LOW_TRAJECTORY", "TERRAIN_HUG" }
-local IMPACTS    = { "SURFACE", "AIRBURST", "BUNKER_BUSTER" }
-
-local strikeCfg = {
-    targetX = 0,
-    targetY = 64,
-    targetZ = 0,
-    count = 4,
-    spread = DEFAULT_SPREAD,
-    modeIdx = 1,
-    profileIdx = 1,
-    impactIdx = 1,
-    mainWindow = "RADAR", -- "RADAR", "STRIKE", or "DEFENSE"
-    activeInputField = "X", -- "X", "Y", "Z", "CNT", "SPR"
-    inputBuffer = "",
-    lastStatus = "Tap [1:RDR][2:STRK][3:DEF]",
-}
 
 local GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
 
@@ -374,7 +395,7 @@ local function buildDispersedTargets(centerX, centerY, centerZ, count, spread)
     return targets
 end
 
-local function executeLaunch(cmd)
+local function executeLaunchNow(cmd)
     local x = tonumber(cmd.x)
     local y = tonumber(cmd.y) or 64
     local z = tonumber(cmd.z)
@@ -408,7 +429,7 @@ local function executeLaunch(cmd)
             end
         end
         if dispatched > 0 then
-            sfxLaunch()
+            queueSfx("launch")
             return true, string.format("THOR STRIKE x%d (3.5s)", dispatched)
         end
         return false, tostring(lastErr or "No Thor rods available")
@@ -438,7 +459,7 @@ local function executeLaunch(cmd)
             end
         end
         if firedCount > 0 then
-            sfxLaunch()
+            queueSfx("launch")
             return true, string.format("FIRED %d (SPR %dm)", firedCount, spread)
         elseif lastErr then
             return false, tostring(lastErr)
@@ -464,7 +485,7 @@ local function executeLaunch(cmd)
 
     local okPlan, resPlan = pcall(mcp.executeFirePlan, missions, delaySeconds)
     if okPlan and resPlan then
-        sfxLaunch()
+        queueSfx("launch")
         return true, tostring(resPlan)
     end
 
@@ -478,23 +499,23 @@ local function executeLaunch(cmd)
         end
     end
     if firedCount > 0 then
-        sfxLaunch()
+        queueSfx("launch")
         return true, string.format("FIRED %d (SPR %dm)", firedCount, spread)
     end
     return false, tostring(lastErr or "Launch failed")
 end
 
 --------------------------------------------------------------------------------
--- 5. Custom Palette Setup
+-- 6. Custom Palette Setup
 --------------------------------------------------------------------------------
 local SHADE_BLIT = {
-    [0] = "f", -- Black (outside circle)
-    [1] = "2", -- Deepest radar background green
-    [2] = "3", -- Trail fade 1 (dim)
-    [3] = "6", -- Trail fade 2 (low-mid)
-    [4] = "b", -- Grid lines / Trail fade 3 (mid)
-    [5] = "a", -- Highlighted grid / Trail fade 4 (bright)
-    [6] = "5", -- Sweep leading edge & center dot (neon green)
+    [0] = "f",
+    [1] = "2",
+    [2] = "3",
+    [3] = "6",
+    [4] = "b",
+    [5] = "a",
+    [6] = "5",
 }
 
 local function setupPalette(target)
@@ -527,27 +548,25 @@ if keyMon then
 end
 
 --------------------------------------------------------------------------------
--- 6. Subpixel Geometry (Shifted right of Left HUD so HUD never overlaps circle)
--- Row 1 is reserved for the Top Screen Switcher Bar; Rows 2..H render the radar!
+-- 7. Subpixel Geometry (Shifted right of Left HUD so HUD never overlaps circle)
 --------------------------------------------------------------------------------
-local RDR_START_ROW = 2
-local RDR_H         = H - 1
-local PW            = W * 2
-local PH            = RDR_H * 3
+local RDR_START_ROW  = 2
+local RDR_H          = H - 1
+local PW             = W * 2
+local PH             = RDR_H * 3
 
--- Reserve left 12 character columns (24 subpixels) for the Left HUD
-local LEFT_HUD_COLS = 12
-local LEFT_SUBPIX   = LEFT_HUD_COLS * 2
+local LEFT_HUD_COLS  = 12
+local LEFT_SUBPIX    = LEFT_HUD_COLS * 2
 local RIGHT_HUD_COLS = (W >= 48) and 11 or 0
 local RIGHT_SUBPIX   = RIGHT_HUD_COLS * 2
 
 local availPW = PW - LEFT_SUBPIX - RIGHT_SUBPIX
-local CX = LEFT_SUBPIX + (availPW + 1) / 2
-local CY = (PH + 1) / 2
-local RADIUS = floor(min(availPW, PH) / 2) - 1
-local NUM_RINGS = 4
+local CX      = LEFT_SUBPIX + (availPW + 1) / 2
+local CY      = (PH + 1) / 2
+local RADIUS  = floor(min(availPW, PH) / 2) - 1
+local NUM_RINGS  = 4
 local NUM_SPOKES = 12
-local TRAIL_ARC = math.rad(65)
+local TRAIL_ARC  = math.rad(65)
 
 local staticDist = {}
 local staticAngle = {}
@@ -615,7 +634,7 @@ for py = 1, PH do
 end
 
 --------------------------------------------------------------------------------
--- 7. Live MCP State, CIWS Defense & Offensive Inventory
+-- 8. Live MCP Polling
 --------------------------------------------------------------------------------
 local OFFENSIVE_NODE_TYPES = {
     PLACED_MISSILE = true,
@@ -625,35 +644,6 @@ local OFFENSIVE_NODE_TYPES = {
     LAUNCH_PAD = true,
     STRATEGIC_SILO = true,
     CRUISE_LAUNCHER = true,
-}
-
-local state = {
-    online = true,
-    empTicks = 0,
-    originX = 0,
-    originY = 64,
-    originZ = 0,
-    radarRange = DEFAULT_RANGE,
-    radarCount = 0,
-    defenseMode = "AUTO",
-    readyCiws = 0,
-    ciwsAmmo = 0,
-    readyInterceptors = 0,
-    launcherCount = 0,
-    readyMissiles = 0,
-    placedCount = 0,
-    siloReady = 0,
-    thorRods = 0,
-    satCount = 0,
-    ciwsNodes = {},
-    blips = {},
-    threatList = {},
-    threatCount = 0,
-    trackCount = 0,
-    flightCount = 0,
-    engaging = false,
-    targetInitialized = false,
-    defenseInitialized = false,
 }
 
 local klaxonFlip = false
@@ -705,7 +695,7 @@ local function pollMcp()
     end
 
     if not state.defenseInitialized then
-        applyDefenseState(defenseEnabled, ox, oz)
+        applyDefenseStateNow(defenseEnabled, ox, oz)
         state.defenseInitialized = true
     end
 
@@ -854,18 +844,16 @@ local function pollMcp()
         end
     end
 
-    -- Only engage threats when Defense is ON!
     if defenseEnabled and (state.threatCount > 0 or #engageIds > 0) then
         local okEng, launched = pcall(mcp.engageThreat)
         if okEng and launched then anyEngaging = true end
     end
 
-    -- Play speaker alerts when threats or CIWS fire are active
     if anyEngaging then
-        sfxCiwsBurst()
+        queueSfx("ciws")
     elseif state.threatCount > 0 then
         klaxonFlip = not klaxonFlip
-        sfxAlertKlaxon(klaxonFlip)
+        queueSfx("klaxon", klaxonFlip)
     end
 
     local okTracks, tracks = pcall(mcp.getTracks)
@@ -969,7 +957,7 @@ local function buildRemoteStatusPayload()
 end
 
 --------------------------------------------------------------------------------
--- 8. Subpixel Framebuffer Rendering & Coordinate Conversion
+-- 9. Subpixel Framebuffer Rendering & Coordinate Conversion
 --------------------------------------------------------------------------------
 local tickCounter = 0
 
@@ -1133,7 +1121,7 @@ local function updateFramebuffer(sweepAngle)
 end
 
 --------------------------------------------------------------------------------
--- 9. UI Rendering for Main Monitor & 4x2 Lower Keypad Deck
+-- 10. UI Rendering for Main Monitor & 4x2 Lower Keypad Deck
 --------------------------------------------------------------------------------
 local function writeHud(target, x, y, text, fg, bg)
     bg = bg or string.rep("f", #text)
@@ -1149,7 +1137,6 @@ local function padRight(str, len)
     return str .. string.rep(" ", len - #str)
 end
 
--- Top Row Tab Bar on Main Monitor (Row 1): Always visible so switching screens is effortless!
 local function drawMainTabBar()
     writeHud(mon, 1, 1, string.rep(" ", W), "0", "7")
     local w1 = (strikeCfg.mainWindow == "RADAR")
@@ -1160,7 +1147,7 @@ local function drawMainTabBar()
     writeHud(mon, 11, 1, w2 and "[2:STRIKE]"  or " 2:STRIKE ",  w2 and "f" or "0", w2 and "4" or "7")
     writeHud(mon, 22, 1, w3 and "[3:DEFENSE]" or " 3:DEFENSE ", w3 and "f" or "0", w3 and "9" or "7")
 
-    if W >= 39 then
+    if W >= 38 then
         if defenseEnabled then
             writeHud(mon, W - 9, 1, "[DEF: ON ]", "f", "5")
         else
@@ -1169,7 +1156,6 @@ local function drawMainTabBar()
     end
 end
 
--- Dedicated 4x2 Keypad Deck Renderer (Zero overlap on 39x12 monitors!)
 local function drawKeypadDeck(target, tw, th, isMainMonitor)
     target.setBackgroundColor(colors.black)
     target.clear()
@@ -1177,7 +1163,6 @@ local function drawKeypadDeck(target, tw, th, isMainMonitor)
     if isMainMonitor then
         drawMainTabBar()
     else
-        -- Row 1 on the 4x2 Keypad Monitor: Screen Switcher Tabs for the Main Screen + Audio Mute
         writeHud(target, 1, 1, string.rep(" ", tw), "0", "7")
         local w1 = (strikeCfg.mainWindow == "RADAR")
         local w2 = (strikeCfg.mainWindow == "STRIKE")
@@ -1189,14 +1174,12 @@ local function drawKeypadDeck(target, tw, th, isMainMonitor)
         writeHud(target, 32, 1, soundEnabled and "[SFX:ON]" or "[SFX:OF]", soundEnabled and "5" or "8", "7")
     end
 
-    -- Row 2 (Left): Big Defense Enable / Disable Toggle Button
     if defenseEnabled then
         writeHud(target, 2, 2, "[DEFENSE: AUTO ON ]  ", "f", "5")
     else
         writeHud(target, 2, 2, "[DEFENSE: HOLD/OFF]  ", "0", "e")
     end
 
-    -- Rows 3..7 (Left Cols 2..22): Coordinate & Salvo Fields
     local fields = {
         { id = "X",   label = "TGT X :", val = tostring(strikeCfg.targetX), row = 3 },
         { id = "Y",   label = "TGT Y :", val = tostring(strikeCfg.targetY), row = 4 },
@@ -1212,7 +1195,6 @@ local function drawKeypadDeck(target, tw, th, isMainMonitor)
         writeHud(target, 2, f.row, padRight(line, 21), active and "4" or "0", active and "7" or "f")
     end
 
-    -- Row 8 & Row 9 (Left Cols 2..22): Mode, Profile, Link 64m & Silo Arm
     local modeName = FIRE_MODES[strikeCfg.modeIdx]
     local profName = PROFILES[strikeCfg.profileIdx]
     writeHud(target, 2,  8, padRight("[M:" .. modeName:sub(1, 7) .. "]", 11), "4", "7")
@@ -1221,14 +1203,12 @@ local function drawKeypadDeck(target, tw, th, isMainMonitor)
     writeHud(target, 2,  9, padRight("[P:" .. profName:sub(1, 7) .. "]", 11), "9", "7")
     writeHud(target, 14, 9, "[ARM SILO]", "f", "1")
 
-    -- Row 10 & 11 (Left Cols 2..22): Launch Strike Button
     writeHud(target, 2, 10, " >>> LAUNCH STRIKE <<<", "0", "e")
     if th >= 12 then
         writeHud(target, 2, 11, string.format(" MSLS:%-2d  CIWS:%d/%d ", state.readyMissiles, state.readyCiws, state.ciwsAmmo), "8", "f")
         writeHud(target, 2, 12, padRight(strikeCfg.lastStatus, tw - 2), "5", "f")
     end
 
-    -- Right Side (Cols 24..38, 15 chars wide): Crisp Touch Numeric Keypad (Never clips on 39-wide screen!)
     local kx = min(24, max(16, tw - 15))
     writeHud(target, kx, 2, "== TOUCH PAD ==", "5", "f")
     writeHud(target, kx, 3, "[ 7 ][ 8 ][ 9 ]", "0", "7")
@@ -1238,7 +1218,6 @@ local function drawKeypadDeck(target, tw, th, isMainMonitor)
     writeHud(target, kx, 11, "[ APPLY / SET ]", "f", "5")
 end
 
--- Window 3 on Main Monitor: Air Defense, CIWS & Node Control Screen
 local function drawDefenseScreen(target, tw, th)
     target.setBackgroundColor(colors.black)
     target.clear()
@@ -1273,7 +1252,6 @@ local function drawMainMonitor()
         return
     end
 
-    -- Window 1: RADAR VIEW
     drawMainTabBar()
 
     for r = 1, RDR_H do
@@ -1365,13 +1343,11 @@ local function drawMainMonitor()
         mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
     end
 
-    -- Left HUD Margin (Cols 1..11, never overlaps radar circle!)
     writeHud(mon, 1, 2, state.online and "NET: ONLINE" or "NET: EMP!  ", state.online and "5" or "e")
     writeHud(mon, 1, 3, padRight("CIWS:" .. state.readyCiws .. "/" .. state.ciwsAmmo, 11), state.readyCiws > 0 and "5" or "e")
     writeHud(mon, 1, 4, padRight("MSLS:" .. state.readyMissiles .. " RDY", 11), state.readyMissiles > 0 and "0" or "e")
     writeHud(mon, 1, 5, padRight("RNG :" .. state.radarRange .. "m", 11), "8")
 
-    -- Prominent Defense Toggle Button on Row 7
     if defenseEnabled then
         if state.threatCount > 0 then
             local flash = (tickCounter % 4 < 2)
@@ -1383,7 +1359,6 @@ local function drawMainMonitor()
         writeHud(mon, 1, 7, "[DEF: OFF] ", "0", "e")
     end
 
-    -- Strike & Navigation Buttons on Left HUD (Rows 9..19)
     writeHud(mon, 1, 9,  "[LINK 64m] ", "f", "9")
     writeHud(mon, 1, 10, padRight("X:" .. strikeCfg.targetX, 11), "0")
     writeHud(mon, 1, 11, padRight("Z:" .. strikeCfg.targetZ, 11), "0")
@@ -1394,7 +1369,6 @@ local function drawMainMonitor()
     writeHud(mon, 1, 18, "[>>FIRE!<<]", "0", "e")
     writeHud(mon, 1, 19, padRight(strikeCfg.lastStatus:sub(1, 11), 11), "8")
 
-    -- Right HUD Margin (only if monitor is wide enough, e.g. 51x19)
     if RIGHT_HUD_COLS > 0 then
         local rx = W - RIGHT_HUD_COLS + 1
         writeHud(mon, rx, 2, "CONTACTS   ", "5")
@@ -1416,12 +1390,13 @@ local function drawMainMonitor()
 end
 
 --------------------------------------------------------------------------------
--- 10. Touch Handlers for Main Monitor & 4x2 Keypad Deck
+-- 11. Instant Non-Blocking Touch Handlers (Zero MCP calls inside touch handler!)
 --------------------------------------------------------------------------------
-local function toggleDefense()
-    applyDefenseState(not defenseEnabled, state.originX, state.originZ)
-    sfxDefenseToggle(defenseEnabled)
-    strikeCfg.lastStatus = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
+local function requestToggleDefense()
+    defenseEnabled = not defenseEnabled
+    queueSfx("def", defenseEnabled)
+    strikeCfg.lastStatus = defenseEnabled and "DEFENSE -> AUTO ON" or "DEFENSE -> HOLD/OFF"
+    queueAction({ type = "SET_DEFENSE", enabled = defenseEnabled })
 end
 
 local function applyKeypadBuffer()
@@ -1440,27 +1415,27 @@ end
 
 local function handleTopTabTouch(x, isKeypadMonitor, tw)
     if isKeypadMonitor then
-        if x >= 6 and x <= 13 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
+        if x >= 1 and x <= 13 then
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
         elseif x >= 14 and x <= 22 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
         elseif x >= 23 and x <= 30 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
         elseif x >= 31 then
             soundEnabled = not soundEnabled
-            sfxClick()
+            queueSfx("click")
             strikeCfg.lastStatus = soundEnabled and "AUDIO: ON" or "AUDIO: MUTED"
             return true
         end
     else
         if x >= 1 and x <= 10 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
         elseif x >= 11 and x <= 21 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
         elseif x >= 22 and x <= 33 then
-            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
-        elseif tw >= 39 and x >= tw - 9 then
-            toggleDefense(); return true
+            queueSfx("click"); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
+        elseif tw >= 38 and x >= tw - 10 then
+            requestToggleDefense(); return true
         end
     end
     return false
@@ -1472,83 +1447,78 @@ local function handleKeypadTouch(tw, th, x, y, isMainMonitor)
         return
     end
 
-    -- Row 2 Left: Defense ON/OFF Toggle
     if y == 2 and x <= 22 then
-        toggleDefense()
+        requestToggleDefense()
         return
     end
 
-    -- Rows 3..7 Left: Field selection
     local fieldByRow = { [3] = "X", [4] = "Y", [5] = "Z", [6] = "CNT", [7] = "SPR" }
     if x <= 22 and fieldByRow[y] then
-        sfxClick()
+        queueSfx("click")
         applyKeypadBuffer()
         strikeCfg.activeInputField = fieldByRow[y]
         strikeCfg.inputBuffer = ""
+        strikeCfg.lastStatus = "Editing " .. fieldByRow[y] .. " on keypad"
         return
     end
 
-    -- Right Side Cols kx..kx+14: Numeric Keypad ([ 7 ][ 8 ][ 9 ] = 5 chars per button)
     local kx = min(24, max(16, tw - 15))
     if x >= kx then
-        local colIdx = floor((x - kx) / 5) + 1 -- 1, 2, or 3
+        local colIdx = floor((x - kx) / 5) + 1
         local keyPressed = nil
         if y == 3 or y == 4 then keyPressed = ({ "7", "8", "9" })[colIdx]
         elseif y == 5 or y == 6 then keyPressed = ({ "4", "5", "6" })[colIdx]
         elseif y == 7 or y == 8 then keyPressed = ({ "1", "2", "3" })[colIdx]
         elseif y == 9 or y == 10 then keyPressed = ({ "-", "0", "CLR" })[colIdx]
-        elseif y == 11 then keyPressed = "ENTER" end
+        elseif y >= 11 then keyPressed = "ENTER" end
 
         if keyPressed == "CLR" then
-            sfxKey()
+            queueSfx("key")
             strikeCfg.inputBuffer = ""
         elseif keyPressed == "ENTER" then
-            sfxClick()
+            queueSfx("click")
             applyKeypadBuffer()
         elseif keyPressed == "-" then
-            sfxKey()
+            queueSfx("key")
             if strikeCfg.inputBuffer == "" then strikeCfg.inputBuffer = "-" end
         elseif keyPressed then
-            sfxKey()
+            queueSfx("key")
             strikeCfg.inputBuffer = strikeCfg.inputBuffer .. keyPressed
         end
         return
     end
 
-    -- Left Side Rows 8..11: Mode, Link 64m, Profile, Arm Silo, Launch Strike
     if y == 8 then
-        sfxClick()
+        queueSfx("click")
         if x < 14 then
             strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
+            strikeCfg.lastStatus = "MODE: " .. FIRE_MODES[strikeCfg.modeIdx]
         else
-            local _, msg = scanAndRegisterDevices(64)
-            strikeCfg.lastStatus = msg
+            strikeCfg.lastStatus = "Scanning 64m..."
+            queueAction({ type = "SCAN" })
         end
     elseif y == 9 then
-        sfxClick()
+        queueSfx("click")
         if x < 14 then
             strikeCfg.profileIdx = (strikeCfg.profileIdx % #PROFILES) + 1
+            strikeCfg.lastStatus = "PROF: " .. PROFILES[strikeCfg.profileIdx]
         else
-            local armed = 0
-            local okS, silos = pcall(mcp.getSilos)
-            if okS and type(silos) == "table" then
-                for _, s in ipairs(silos) do
-                    if not s.valvesOpen then pcall(mcp.siloAction, s.id, "VALVES") end
-                    if pcall(mcp.siloAction, s.id, "ARM") then armed = armed + 1 end
-                end
-            end
-            strikeCfg.lastStatus = string.format("ARMED %d SILO(S)", armed)
+            strikeCfg.lastStatus = "Arming Silos..."
+            queueAction({ type = "SILO_ARM" })
         end
-    elseif y == 10 then
+    elseif y >= 10 and y <= 11 then
         applyKeypadBuffer()
-        local _, msg = executeLaunch({
-            x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
-            count = strikeCfg.count, spread = strikeCfg.spread,
-            fireMode = FIRE_MODES[strikeCfg.modeIdx],
-            attackProfile = PROFILES[strikeCfg.profileIdx],
-            impactMode = IMPACTS[strikeCfg.impactIdx],
+        strikeCfg.lastStatus = "LAUNCHING STRIKE..."
+        queueAction({
+            type = "FIRE",
+            cmd = {
+                x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
+                count = strikeCfg.count, spread = strikeCfg.spread,
+                fireMode = FIRE_MODES[strikeCfg.modeIdx],
+                attackProfile = PROFILES[strikeCfg.profileIdx],
+                impactMode = IMPACTS[strikeCfg.impactIdx],
+            },
         })
-        strikeCfg.lastStatus = msg
     end
 end
 
@@ -1556,15 +1526,15 @@ local function handleDefenseScreenTouch(x, y)
     if y == 1 then
         handleTopTabTouch(x, false, W)
         return
-    elseif y == 5 or y == 6 then
-        toggleDefense()
-    elseif y == 14 then
-        sfxClick()
-        local _, msg = scanAndRegisterDevices(64)
-        strikeCfg.lastStatus = msg
-    elseif y == 16 then
+    elseif y >= 4 and y <= 7 then
+        requestToggleDefense()
+    elseif y >= 13 and y <= 15 then
+        queueSfx("click")
+        strikeCfg.lastStatus = "Scanning 64m..."
+        queueAction({ type = "SCAN" })
+    elseif y >= 16 and y <= 17 then
         soundEnabled = not soundEnabled
-        sfxClick()
+        queueSfx("click")
         strikeCfg.lastStatus = soundEnabled and "AUDIO: ENABLED" or "AUDIO: MUTED"
     end
 end
@@ -1583,47 +1553,48 @@ local function handleMainRadarTouch(x, y)
         return
     end
 
-    -- Left HUD buttons (Cols 1..12)
     if x <= LEFT_HUD_COLS then
-        if y == 7 then
-            toggleDefense()
+        if y >= 6 and y <= 8 then
+            requestToggleDefense()
         elseif y == 9 then
-            sfxClick()
-            local _, msg = scanAndRegisterDevices(64)
-            strikeCfg.lastStatus = msg
-        elseif y == 10 or y == 11 or y == 16 then
-            sfxClick()
+            queueSfx("click")
+            strikeCfg.lastStatus = "Scanning 64m..."
+            queueAction({ type = "SCAN" })
+        elseif y == 10 or y == 11 or y == 15 or y == 16 then
+            queueSfx("click")
             strikeCfg.mainWindow = "STRIKE"
         elseif y == 12 then
-            sfxClick()
+            queueSfx("click")
             if x <= 8 then strikeCfg.count = max(1, strikeCfg.count - 1)
             else strikeCfg.count = min(64, strikeCfg.count + 1) end
         elseif y == 13 then
-            sfxClick()
+            queueSfx("click")
             if x <= 8 then strikeCfg.spread = max(0, strikeCfg.spread - 4)
             else strikeCfg.spread = min(256, strikeCfg.spread + 4) end
         elseif y == 14 then
-            sfxClick()
+            queueSfx("click")
             strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
-        elseif y == 18 then
-            local _, msg = executeLaunch({
-                x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
-                count = strikeCfg.count, spread = strikeCfg.spread,
-                fireMode = FIRE_MODES[strikeCfg.modeIdx],
-                attackProfile = PROFILES[strikeCfg.profileIdx],
-                impactMode = IMPACTS[strikeCfg.impactIdx],
+        elseif y >= 17 and y <= 19 then
+            strikeCfg.lastStatus = "LAUNCHING STRIKE..."
+            queueAction({
+                type = "FIRE",
+                cmd = {
+                    x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
+                    count = strikeCfg.count, spread = strikeCfg.spread,
+                    fireMode = FIRE_MODES[strikeCfg.modeIdx],
+                    attackProfile = PROFILES[strikeCfg.profileIdx],
+                    impactMode = IMPACTS[strikeCfg.impactIdx],
+                },
             })
-            strikeCfg.lastStatus = msg
         end
         return
     end
 
-    -- Right HUD contact lock
     if RIGHT_HUD_COLS > 0 and x >= (W - RIGHT_HUD_COLS + 1) then
         local idx = floor((y - 3) / 3) + 1
         local item = state.threatList[idx]
         if item and item.x and item.z then
-            sfxClick()
+            queueSfx("click")
             strikeCfg.targetX = item.x
             strikeCfg.targetZ = item.z
             strikeCfg.lastStatus = string.format("LOCK %d,%d", item.x, item.z)
@@ -1631,10 +1602,9 @@ local function handleMainRadarTouch(x, y)
         return
     end
 
-    -- Radar Circle tap-to-aim
     local wx, wz = monitorClickToWorld(x, y)
     if wx and wz then
-        sfxClick()
+        queueSfx("click")
         strikeCfg.targetX = wx
         strikeCfg.targetZ = wz
         strikeCfg.lastStatus = string.format("AIM %d,%d", wx, wz)
@@ -1642,7 +1612,7 @@ local function handleMainRadarTouch(x, y)
 end
 
 --------------------------------------------------------------------------------
--- 11. Computer Terminal UI
+-- 12. Computer Terminal UI
 --------------------------------------------------------------------------------
 local function drawComputerTerminal()
     term.setBackgroundColor(colors.black)
@@ -1686,128 +1656,138 @@ local function promptTerminalLine(promptText)
 end
 
 --------------------------------------------------------------------------------
--- 12. Encrypted Wireless Packet Handler (from pocket_remote.lua)
+-- 13. Parallel Coroutines (Prevents MCP calls from ever dropping touch/modem events!)
 --------------------------------------------------------------------------------
-local function handleModemMessage(replyChannel, wrapper)
-    if not modem then return end
-    local msg = decryptPacket(wrapper)
-    if not msg then return end
 
-    if msg.type == "PING" or msg.type == "STATUS" then
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "STATUS_REPLY",
-            requestId = msg.requestId,
-            serverId = os.getComputerID(),
-            status = buildRemoteStatusPayload(),
-        }))
-    elseif msg.type == "FIRE" then
-        local ok, resMsg = executeLaunch(msg)
-        strikeCfg.lastStatus = "REMOTE: " .. tostring(resMsg)
-        pollMcp()
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "FIRE_REPLY",
-            requestId = msg.requestId,
-            ok = ok,
-            message = resMsg,
-            status = buildRemoteStatusPayload(),
-        }))
-        drawComputerTerminal()
-    elseif msg.type == "TOGGLE_DEFENSE" then
-        if type(msg.enabled) == "boolean" then
-            applyDefenseState(msg.enabled, state.originX, state.originZ)
+-- Coroutine A: Instant Monitor Touch Listener
+local function touchLoop()
+    while true do
+        local _, side, tx, ty = os.pullEvent("monitor_touch")
+        if keyMonName and side == keyMonName then
+            local kw, kh = keyMon.getSize()
+            handleKeypadTouch(kw, kh, tx, ty, false)
         else
-            applyDefenseState(not defenseEnabled, state.originX, state.originZ)
+            handleMainRadarTouch(tx, ty)
         end
-        sfxDefenseToggle(defenseEnabled)
-        local resMsg = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
-        strikeCfg.lastStatus = "REMOTE: " .. resMsg
-        pollMcp()
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "FIRE_REPLY",
-            requestId = msg.requestId,
-            ok = true,
-            message = resMsg,
-            status = buildRemoteStatusPayload(),
-        }))
-        drawComputerTerminal()
-    elseif msg.type == "SCAN_REGISTER" then
-        sfxClick()
-        local ok, resMsg = scanAndRegisterDevices(msg.radius or 64)
-        strikeCfg.lastStatus = "REMOTE: " .. tostring(resMsg)
-        pollMcp()
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "FIRE_REPLY",
-            requestId = msg.requestId,
-            ok = ok,
-            message = resMsg,
-            status = buildRemoteStatusPayload(),
-        }))
-        drawComputerTerminal()
-    elseif msg.type == "REGISTER_XYZ" then
-        sfxClick()
-        local rx, ry, rz = tonumber(msg.x), tonumber(msg.y), tonumber(msg.z)
-        local okReg, resReg = false, "Invalid XYZ"
-        if rx and ry and rz and mcp.registerRocket then
-            local callOk, tbl = pcall(mcp.registerRocket, rx, ry, rz, msg.name)
-            if callOk and type(tbl) == "table" then
-                okReg = tbl.registered == true
-                resReg = tostring(tbl.message or (okReg and "REGISTERED" or "FAILED"))
-            else
-                resReg = tostring(tbl)
-            end
+        drawMainMonitor()
+        if keyMon then
+            local kw, kh = keyMon.getSize()
+            drawKeypadDeck(keyMon, kw, kh, false)
         end
-        pollMcp()
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "FIRE_REPLY",
-            requestId = msg.requestId,
-            ok = okReg,
-            message = resReg,
-            status = buildRemoteStatusPayload(),
-        }))
         drawComputerTerminal()
-    elseif msg.type == "SILO_ARM" then
-        sfxClick()
-        local armedCount = 0
-        local okSilos, silos = pcall(mcp.getSilos)
-        if okSilos and type(silos) == "table" then
-            for _, s in ipairs(silos) do
-                if not s.valvesOpen then pcall(mcp.siloAction, s.id, "VALVES") end
-                if pcall(mcp.siloAction, s.id, "ARM") then armedCount = armedCount + 1 end
-            end
-        end
-        pollMcp()
-        modem.transmit(replyChannel, CHANNEL, encryptPacket({
-            type = "FIRE_REPLY",
-            requestId = msg.requestId,
-            ok = true,
-            message = string.format("ARMED %d SILO(S)", armedCount),
-            status = buildRemoteStatusPayload(),
-        }))
     end
 end
 
---------------------------------------------------------------------------------
--- 13. Main Concurrent Event + Render Loop
---------------------------------------------------------------------------------
-local sweepAngle = math.rad(45)
-local SWEEP_SPEED = math.rad(6)
-local lastPoll = 0
-
-pollMcp()
-drawComputerTerminal()
-
-local frameTimer = os.startTimer(0.05)
-
-while true do
-    local event, p1, p2, p3, p4 = os.pullEvent()
-
-    if event == "timer" and p1 == frameTimer then
-        local now = os.clock()
-        if now - lastPoll >= POLL_INTERVAL then
-            pollMcp()
-            lastPoll = now
+-- Coroutine B: Instant Wireless Modem Listener
+local function modemLoop()
+    while true do
+        local _, _, _, replyChannel, wrapper = os.pullEvent("modem_message")
+        if modem then
+            local msg = decryptPacket(wrapper)
+            if msg then
+                if msg.type == "PING" or msg.type == "STATUS" then
+                    modem.transmit(replyChannel, CHANNEL, encryptPacket({
+                        type = "STATUS_REPLY",
+                        requestId = msg.requestId,
+                        serverId = os.getComputerID(),
+                        status = buildRemoteStatusPayload(),
+                    }))
+                else
+                    queueAction({
+                        type = "REMOTE_CMD",
+                        replyChannel = replyChannel,
+                        msg = msg,
+                    })
+                end
+            end
         end
+    end
+end
 
+-- Coroutine C: Computer Keyboard Listener
+local function keyboardLoop()
+    while true do
+        local _, k = os.pullEvent("key")
+        if k == keys.one then
+            queueSfx("click"); strikeCfg.mainWindow = "RADAR"; drawMainMonitor(); drawComputerTerminal()
+        elseif k == keys.two then
+            queueSfx("click"); strikeCfg.mainWindow = "STRIKE"; drawMainMonitor(); drawComputerTerminal()
+        elseif k == keys.three then
+            queueSfx("click"); strikeCfg.mainWindow = "DEFENSE"; drawMainMonitor(); drawComputerTerminal()
+        elseif k == keys.tab then
+            queueSfx("click")
+            if strikeCfg.mainWindow == "RADAR" then strikeCfg.mainWindow = "STRIKE"
+            elseif strikeCfg.mainWindow == "STRIKE" then strikeCfg.mainWindow = "DEFENSE"
+            else strikeCfg.mainWindow = "RADAR" end
+            drawMainMonitor(); drawComputerTerminal()
+        elseif k == keys.d then
+            requestToggleDefense()
+            drawMainMonitor(); drawComputerTerminal()
+        elseif k == keys.x then
+            sleep(0.05)
+            local v = tonumber(promptTerminalLine("Enter Target X: "))
+            if v then strikeCfg.targetX = floor(v) end
+            drawComputerTerminal()
+        elseif k == keys.y then
+            sleep(0.05)
+            local v = tonumber(promptTerminalLine("Enter Target Y: "))
+            if v then strikeCfg.targetY = max(-64, min(320, floor(v))) end
+            drawComputerTerminal()
+        elseif k == keys.z then
+            sleep(0.05)
+            local v = tonumber(promptTerminalLine("Enter Target Z: "))
+            if v then strikeCfg.targetZ = floor(v) end
+            drawComputerTerminal()
+        elseif k == keys.c then
+            sleep(0.05)
+            local v = tonumber(promptTerminalLine("Enter Missile Count (1-64): "))
+            if v then strikeCfg.count = max(1, min(64, floor(v))) end
+            drawComputerTerminal()
+        elseif k == keys.s then
+            sleep(0.05)
+            local v = tonumber(promptTerminalLine("Enter Spread Radius (0-256m): "))
+            if v then strikeCfg.spread = max(0, min(256, floor(v))) end
+            drawComputerTerminal()
+        elseif k == keys.m then
+            queueSfx("click")
+            strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
+            drawComputerTerminal()
+        elseif k == keys.r then
+            queueSfx("click")
+            strikeCfg.lastStatus = "Scanning 64m..."
+            queueAction({ type = "SCAN" })
+            drawComputerTerminal()
+        elseif k == keys.k then
+            sleep(0.05)
+            local newK = promptTerminalLine("New Secret Key (match on pocket): ")
+            if newK and #newK > 0 then
+                SECRET_KEY = newK
+                saveSecretKey(SECRET_KEY)
+                strikeCfg.lastStatus = "Encryption key updated!"
+            end
+            drawComputerTerminal()
+        elseif k == keys.f or k == keys.enter then
+            strikeCfg.lastStatus = "LAUNCHING STRIKE..."
+            queueAction({
+                type = "FIRE",
+                cmd = {
+                    x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
+                    count = strikeCfg.count, spread = strikeCfg.spread,
+                    fireMode = FIRE_MODES[strikeCfg.modeIdx],
+                    attackProfile = PROFILES[strikeCfg.profileIdx],
+                    impactMode = IMPACTS[strikeCfg.impactIdx],
+                },
+            })
+            drawComputerTerminal()
+        end
+    end
+end
+
+-- Coroutine D: 20 FPS Radar Sweep & Monitor Renderer (Pure Lua, never blocks on MCP)
+local function renderLoop()
+    local sweepAngle = math.rad(45)
+    local SWEEP_SPEED = math.rad(6)
+    while true do
         tickCounter = tickCounter + 1
         updateFramebuffer(sweepAngle)
         drawMainMonitor()
@@ -1820,112 +1800,118 @@ while true do
         if state.online then
             local prevAngle = sweepAngle
             sweepAngle = (sweepAngle + SWEEP_SPEED) % TWO_PI
-            -- Subtle sonar ping each time the sweep passes North (0 rad)
             if sweepAngle < prevAngle then
-                sfxPing(state.threatCount > 0)
+                queueSfx("ping", state.threatCount > 0)
             end
         end
-        frameTimer = os.startTimer(0.05)
+        sleep(0.05)
+    end
+end
 
-    elseif event == "monitor_touch" then
-        local side, tx, ty = p1, p2, p3
-        if keyMonName and side == keyMonName then
-            local kw, kh = keyMon.getSize()
-            handleKeypadTouch(kw, kh, tx, ty, false)
-            drawKeypadDeck(keyMon, kw, kh, false)
-            drawMainMonitor()
-        else
-            handleMainRadarTouch(tx, ty)
-            drawMainMonitor()
-            if keyMon then
-                local kw, kh = keyMon.getSize()
-                drawKeypadDeck(keyMon, kw, kh, false)
+-- Coroutine E: Background MCP Worker & Speaker Player
+local function mcpWorkerLoop()
+    scanAndRegisterDevicesNow(64)
+    pollMcp()
+    drawComputerTerminal()
+
+    local pollTimer = os.startTimer(POLL_INTERVAL)
+    while true do
+        while #actionQueue > 0 do
+            local act = table.remove(actionQueue, 1)
+            if act.type == "SET_DEFENSE" then
+                applyDefenseStateNow(act.enabled, state.originX, state.originZ)
+                strikeCfg.lastStatus = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
+                pollMcp()
+                drawComputerTerminal()
+            elseif act.type == "SCAN" then
+                local _, msg = scanAndRegisterDevicesNow(64)
+                strikeCfg.lastStatus = msg
+                pollMcp()
+                drawComputerTerminal()
+            elseif act.type == "SILO_ARM" then
+                local armed = 0
+                local okS, silos = pcall(mcp.getSilos)
+                if okS and type(silos) == "table" then
+                    for _, s in ipairs(silos) do
+                        if not s.valvesOpen then pcall(mcp.siloAction, s.id, "VALVES") end
+                        if pcall(mcp.siloAction, s.id, "ARM") then armed = armed + 1 end
+                    end
+                end
+                strikeCfg.lastStatus = string.format("ARMED %d SILO(S)", armed)
+                pollMcp()
+                drawComputerTerminal()
+            elseif act.type == "FIRE" then
+                local _, msg = executeLaunchNow(act.cmd)
+                strikeCfg.lastStatus = msg
+                pollMcp()
+                drawComputerTerminal()
+            elseif act.type == "REMOTE_CMD" then
+                local msg = act.msg
+                local replyChannel = act.replyChannel
+                local okRes, resMsg = true, "OK"
+
+                if msg.type == "FIRE" then
+                    okRes, resMsg = executeLaunchNow(msg)
+                    strikeCfg.lastStatus = "REMOTE: " .. tostring(resMsg)
+                elseif msg.type == "TOGGLE_DEFENSE" then
+                    local targetState = (type(msg.enabled) == "boolean") and msg.enabled or (not defenseEnabled)
+                    applyDefenseStateNow(targetState, state.originX, state.originZ)
+                    queueSfx("def", defenseEnabled)
+                    resMsg = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
+                    strikeCfg.lastStatus = "REMOTE: " .. resMsg
+                elseif msg.type == "SCAN_REGISTER" then
+                    queueSfx("click")
+                    okRes, resMsg = scanAndRegisterDevicesNow(msg.radius or 64)
+                    strikeCfg.lastStatus = "REMOTE: " .. tostring(resMsg)
+                elseif msg.type == "REGISTER_XYZ" then
+                    queueSfx("click")
+                    local rx, ry, rz = tonumber(msg.x), tonumber(msg.y), tonumber(msg.z)
+                    okRes, resMsg = false, "Invalid XYZ"
+                    if rx and ry and rz and mcp.registerRocket then
+                        local callOk, tbl = pcall(mcp.registerRocket, rx, ry, rz, msg.name)
+                        if callOk and type(tbl) == "table" then
+                            okRes = tbl.registered == true
+                            resMsg = tostring(tbl.message or (okRes and "REGISTERED" or "FAILED"))
+                        else
+                            resMsg = tostring(tbl)
+                        end
+                    end
+                elseif msg.type == "SILO_ARM" then
+                    queueSfx("click")
+                    local armedCount = 0
+                    local okSilos, silos = pcall(mcp.getSilos)
+                    if okSilos and type(silos) == "table" then
+                        for _, s in ipairs(silos) do
+                            if not s.valvesOpen then pcall(mcp.siloAction, s.id, "VALVES") end
+                            if pcall(mcp.siloAction, s.id, "ARM") then armedCount = armedCount + 1 end
+                        end
+                    end
+                    resMsg = string.format("ARMED %d SILO(S)", armedCount)
+                end
+
+                pollMcp()
+                if modem then
+                    modem.transmit(replyChannel, CHANNEL, encryptPacket({
+                        type = "FIRE_REPLY",
+                        requestId = msg.requestId,
+                        ok = okRes,
+                        message = resMsg,
+                        status = buildRemoteStatusPayload(),
+                    }))
+                end
+                drawComputerTerminal()
             end
         end
-        drawComputerTerminal()
 
-    elseif event == "modem_message" then
-        local replyChannel, wrapper = p3, p4
-        handleModemMessage(replyChannel, wrapper)
+        flushSfxQueue()
 
-    elseif event == "key" then
-        local k = p1
-        if k == keys.one then
-            sfxClick(); strikeCfg.mainWindow = "RADAR"; drawComputerTerminal()
-        elseif k == keys.two then
-            sfxClick(); strikeCfg.mainWindow = "STRIKE"; drawComputerTerminal()
-        elseif k == keys.three then
-            sfxClick(); strikeCfg.mainWindow = "DEFENSE"; drawComputerTerminal()
-        elseif k == keys.tab then
-            sfxClick()
-            if strikeCfg.mainWindow == "RADAR" then strikeCfg.mainWindow = "STRIKE"
-            elseif strikeCfg.mainWindow == "STRIKE" then strikeCfg.mainWindow = "DEFENSE"
-            else strikeCfg.mainWindow = "RADAR" end
-            drawComputerTerminal()
-        elseif k == keys.d then
-            toggleDefense()
-            drawComputerTerminal()
-        elseif k == keys.x then
-            sleep(0.05)
-            local v = tonumber(promptTerminalLine("Enter Target X: "))
-            if v then strikeCfg.targetX = floor(v) end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.y then
-            sleep(0.05)
-            local v = tonumber(promptTerminalLine("Enter Target Y: "))
-            if v then strikeCfg.targetY = max(-64, min(320, floor(v))) end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.z then
-            sleep(0.05)
-            local v = tonumber(promptTerminalLine("Enter Target Z: "))
-            if v then strikeCfg.targetZ = floor(v) end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.c then
-            sleep(0.05)
-            local v = tonumber(promptTerminalLine("Enter Missile Count (1-64): "))
-            if v then strikeCfg.count = max(1, min(64, floor(v))) end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.s then
-            sleep(0.05)
-            local v = tonumber(promptTerminalLine("Enter Spread Radius (0-256m): "))
-            if v then strikeCfg.spread = max(0, min(256, floor(v))) end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.m then
-            sfxClick()
-            strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
-            drawComputerTerminal()
-        elseif k == keys.r then
-            sfxClick()
-            local _, msg = scanAndRegisterDevices(64)
-            strikeCfg.lastStatus = msg
+        local ev, p1 = os.pullEvent()
+        if ev == "timer" and p1 == pollTimer then
             pollMcp()
-            drawComputerTerminal()
-        elseif k == keys.k then
-            sleep(0.05)
-            local newK = promptTerminalLine("New Secret Key (match on pocket): ")
-            if newK and #newK > 0 then
-                SECRET_KEY = newK
-                saveSecretKey(SECRET_KEY)
-                strikeCfg.lastStatus = "Encryption key updated!"
-            end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
-        elseif k == keys.f or k == keys.enter then
-            local _, msg = executeLaunch({
-                x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
-                count = strikeCfg.count, spread = strikeCfg.spread,
-                fireMode = FIRE_MODES[strikeCfg.modeIdx],
-                attackProfile = PROFILES[strikeCfg.profileIdx],
-                impactMode = IMPACTS[strikeCfg.impactIdx],
-            })
-            strikeCfg.lastStatus = msg
-            pollMcp()
-            drawComputerTerminal()
+            flushSfxQueue()
+            pollTimer = os.startTimer(POLL_INTERVAL)
         end
     end
 end
+
+parallel.waitForAny(touchLoop, modemLoop, keyboardLoop, renderLoop, mcpWorkerLoop)
