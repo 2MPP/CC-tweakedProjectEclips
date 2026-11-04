@@ -147,7 +147,7 @@ local function decryptPacket(wrapper)
 end
 
 --------------------------------------------------------------------------------
--- 2. Speaker Audio Engine (speaker_0) - Queued so it never blocks UI touch
+-- 2. Speaker Audio Engine (speaker_0) - Dedicated parallel coroutine
 --------------------------------------------------------------------------------
 local speaker = peripheral.wrap("speaker_0") or peripheral.find("speaker")
 local soundEnabled = true
@@ -155,40 +155,83 @@ local sfxQueue = {}
 
 local function queueSfx(kind, arg)
     if not speaker or not soundEnabled then return end
-    if #sfxQueue < 6 then
+    if #sfxQueue < 12 then
         table.insert(sfxQueue, { kind = kind, arg = arg })
+        os.queueEvent("eclipse_sfx")
     end
 end
 
-local function flushSfxQueue()
-    if not speaker or #sfxQueue == 0 then return end
-    local item = table.remove(sfxQueue, 1)
-    if not soundEnabled then return end
-    local k = item.kind
-    if k == "click" then
-        pcall(speaker.playNote, "hat", 0.8, 18)
-    elseif k == "key" then
-        pcall(speaker.playNote, "bit", 0.7, 14)
-    elseif k == "ping" then
-        if item.arg then
-            pcall(speaker.playNote, "pling", 0.9, 16)
-        else
-            pcall(speaker.playNote, "bit", 0.15, 6)
+local function playRadarSweepBlip(hasThreats)
+    if not speaker or not soundEnabled then return end
+    if hasThreats then
+        -- Urgent high radar ping when threats are on scope
+        pcall(speaker.playNote, "pling", 2.5, 20)
+        pcall(speaker.playNote, "bit", 1.8, 20)
+        sleep(0.07)
+        pcall(speaker.playNote, "pling", 0.9, 20)
+    else
+        -- Classic submarine / air-search radar sonar blip + faint echo
+        pcall(speaker.playNote, "pling", 1.8, 16)
+        pcall(speaker.playNote, "bit", 1.2, 16)
+        sleep(0.08)
+        pcall(speaker.playNote, "pling", 0.6, 16)
+    end
+end
+
+local function playContactHitBlip(prio)
+    if not speaker or not soundEnabled then return end
+    local pitch = (prio and prio >= 4) and 22 or 19
+    pcall(speaker.playNote, "bit", 2.2, pitch)
+    pcall(speaker.playNote, "pling", 2.0, pitch)
+end
+
+local function audioLoop()
+    -- Play startup radar power-on chime on speaker_0
+    if speaker and soundEnabled then
+        pcall(speaker.playNote, "bit", 1.5, 10)
+        sleep(0.06)
+        pcall(speaker.playNote, "bit", 1.8, 14)
+        sleep(0.06)
+        pcall(speaker.playNote, "pling", 2.2, 18)
+    end
+
+    while true do
+        if #sfxQueue == 0 then
+            os.pullEvent("eclipse_sfx")
         end
-    elseif k == "klaxon" then
-        pcall(speaker.playNote, "didgeridoo", 1.5, item.arg and 10 or 6)
-        pcall(speaker.playNote, "bell", 1.0, item.arg and 14 or 10)
-    elseif k == "ciws" then
-        pcall(speaker.playSound, "entity.generic.explode", 0.35, 1.8)
-        pcall(speaker.playNote, "snare", 0.9, 20)
-    elseif k == "launch" then
-        pcall(speaker.playSound, "entity.firework_rocket.launch", 2.0, 0.7)
-        pcall(speaker.playNote, "chime", 1.5, 12)
-    elseif k == "def" then
-        if item.arg then
-            pcall(speaker.playNote, "pling", 1.0, 16)
-        else
-            pcall(speaker.playNote, "bass", 1.0, 5)
+        while #sfxQueue > 0 do
+            local item = table.remove(sfxQueue, 1)
+            if speaker and soundEnabled then
+                local k = item.kind
+                if k == "click" then
+                    pcall(speaker.playNote, "hat", 1.5, 18)
+                elseif k == "key" then
+                    pcall(speaker.playNote, "bit", 1.5, 15)
+                elseif k == "ping" then
+                    playRadarSweepBlip(item.arg)
+                elseif k == "contact_blip" then
+                    playContactHitBlip(item.arg)
+                elseif k == "klaxon" then
+                    pcall(speaker.playNote, "didgeridoo", 2.5, item.arg and 10 or 6)
+                    pcall(speaker.playNote, "bell", 2.0, item.arg and 14 or 10)
+                elseif k == "ciws" then
+                    pcall(speaker.playSound, "entity.generic.explode", 0.8, 1.8)
+                    pcall(speaker.playNote, "snare", 2.0, 20)
+                elseif k == "launch" then
+                    pcall(speaker.playSound, "entity.firework_rocket.launch", 3.0, 0.7)
+                    pcall(speaker.playNote, "chime", 2.5, 12)
+                elseif k == "def" then
+                    if item.arg then
+                        pcall(speaker.playNote, "pling", 2.0, 14)
+                        sleep(0.06)
+                        pcall(speaker.playNote, "pling", 2.2, 19)
+                    else
+                        pcall(speaker.playNote, "bass", 2.0, 10)
+                        sleep(0.06)
+                        pcall(speaker.playNote, "bass", 2.0, 4)
+                    end
+                end
+            end
         end
     end
 end
@@ -1800,15 +1843,34 @@ local function renderLoop()
         if state.online then
             local prevAngle = sweepAngle
             sweepAngle = (sweepAngle + SWEEP_SPEED) % TWO_PI
+
+            -- Play classic radar sonar ping each time the sweep passes North (12 o'clock)
             if sweepAngle < prevAngle then
                 queueSfx("ping", state.threatCount > 0)
+            end
+
+            -- Play a sharp radar blip whenever the sweep beam passes over a contact!
+            for _, blip in ipairs(state.blips) do
+                local dx = blip.x - state.originX
+                local dz = blip.z - state.originZ
+                local bAng = (atan2(dx, -dz) + TWO_PI) % TWO_PI
+                local crossed = false
+                if prevAngle <= sweepAngle then
+                    crossed = (bAng >= prevAngle and bAng < sweepAngle)
+                else
+                    crossed = (bAng >= prevAngle or bAng < sweepAngle)
+                end
+                if crossed then
+                    queueSfx("contact_blip", blip.prio)
+                    break
+                end
             end
         end
         sleep(0.05)
     end
 end
 
--- Coroutine E: Background MCP Worker & Speaker Player
+-- Coroutine E: Background MCP Worker
 local function mcpWorkerLoop()
     scanAndRegisterDevicesNow(64)
     pollMcp()
@@ -1903,15 +1965,12 @@ local function mcpWorkerLoop()
             end
         end
 
-        flushSfxQueue()
-
         local ev, p1 = os.pullEvent()
         if ev == "timer" and p1 == pollTimer then
             pollMcp()
-            flushSfxQueue()
             pollTimer = os.startTimer(POLL_INTERVAL)
         end
     end
 end
 
-parallel.waitForAny(touchLoop, modemLoop, keyboardLoop, renderLoop, mcpWorkerLoop)
+parallel.waitForAny(touchLoop, modemLoop, keyboardLoop, renderLoop, mcpWorkerLoop, audioLoop)
