@@ -1,13 +1,11 @@
--- Project Eclipse - Unified Radar, CIWS Defense & Encrypted Strike Server (CC:Tweaked)
--- Primary monitor: monitor_0 (51x19)
--- Optional secondary monitor (e.g. 4x2 touch keyboard monitor): auto-detected if connected
+-- Project Eclipse - Unified Radar, CIWS Defense, Audio & Encrypted Strike Server (CC:Tweaked)
+-- Automatically pairs your main Radar Monitor + 4x2 Touch Keypad Monitor + speaker_0 + Wireless Modem.
 -- Includes:
---   * 102x57 square-subpixel phosphor radar scope + CIWS auto-intercept
---   * Built-in encrypted wireless launch server for pocket_remote.lua
---   * Main-screen click-to-target on radar circle + on-screen touch keypad & launch controls
---   * Automatic rocket/device registration via mcp.scanAndRegister() & mcp.registerRocket()
+--   * Top Tab Bar on both monitors: [1:RDR] [2:STRK] [3:DEF] to switch screens anytime
+--   * One-tap [DEFENSE: ON / OFF] button to disable/enable CIWS & interceptors
+--   * Rich speaker_0 sound effects (radar sonar pings, missile klaxon, CIWS burst, launch audio, UI clicks)
+--   * Clean zero-overlap layout for both the upright radar monitor and 4x2 (39x12) keypad deck
 
-local MONITOR_NAME   = "monitor_0"
 local CHANNEL        = 4920
 local PROTOCOL       = "ECLIPSE_ENC_V2"
 local KEY_FILE       = ".eclipse_key"
@@ -120,32 +118,31 @@ end
 local seenNonces = {}
 local seenNonceOrder = {}
 
-local function decryptPacket(Wrapper)
-    if type(Wrapper) ~= "table" or Wrapper.protocol ~= PROTOCOL then
+local function decryptPacket(wrapper)
+    if type(wrapper) ~= "table" or wrapper.protocol ~= PROTOCOL then
         return nil, "Bad protocol"
     end
-    if type(Wrapper.nonce) ~= "string" or type(Wrapper.cipher) ~= "string" or type(Wrapper.mac) ~= "string" then
+    if type(wrapper.nonce) ~= "string" or type(wrapper.cipher) ~= "string" or type(wrapper.mac) ~= "string" then
         return nil, "Malformed packet"
     end
-    if seenNonces[Wrapper.nonce] then
+    if seenNonces[wrapper.nonce] then
         return nil, "Replay rejected"
     end
-    local expectedMac = computeMac(SECRET_KEY, Wrapper.nonce, Wrapper.cipher)
-    if expectedMac ~= Wrapper.mac then
+    local expectedMac = computeMac(SECRET_KEY, Wrapper and Wrapper.nonce or wrapper.nonce, wrapper.cipher)
+    if expectedMac ~= wrapper.mac then
         return nil, "Auth MAC mismatch (wrong key)"
     end
 
-    -- Record nonce to block replay attacks
-    seenNonces[Wrapper.nonce] = true
-    table.insert(seenNonceOrder, Wrapper.nonce)
+    seenNonces[wrapper.nonce] = true
+    table.insert(seenNonceOrder, wrapper.nonce)
     if #seenNonceOrder > 64 then
         local old = table.remove(seenNonceOrder, 1)
         seenNonces[old] = nil
     end
 
-    local rawCipher = fromHex(Wrapper.cipher)
+    local rawCipher = fromHex(wrapper.cipher)
     if not rawCipher then return nil, "Bad hex" end
-    local plain = cryptBytes(rawCipher, SECRET_KEY, Wrapper.nonce)
+    local plain = cryptBytes(rawCipher, SECRET_KEY, wrapper.nonce)
     local ok, tbl = pcall(textutils.unserialize, plain)
     if not ok or type(tbl) ~= "table" then
         return nil, "Unserialize failed"
@@ -154,31 +151,93 @@ local function decryptPacket(Wrapper)
 end
 
 --------------------------------------------------------------------------------
--- 2. Peripheral Discovery (Monitors, MCP, Wireless Modem)
+-- 2. Speaker Audio Engine (speaker_0)
 --------------------------------------------------------------------------------
-local mon = peripheral.wrap(MONITOR_NAME) or peripheral.find("monitor")
-if not mon then
-    error("Could not find " .. MONITOR_NAME .. " (or any connected monitor)")
-end
-mon.setTextScale(1)
-local W, H = mon.getSize()
+local speaker = peripheral.wrap("speaker_0") or peripheral.find("speaker")
+local soundEnabled = true
 
--- Optional second monitor (e.g. a 4x2 touch keypad monitor)
-local keyMon = nil
-local keyMonName = nil
+local function sfxClick()
+    if not speaker or not soundEnabled then return end
+    pcall(speaker.playNote, "hat", 0.7, 18)
+end
+
+local function sfxKey()
+    if not speaker or not soundEnabled then return end
+    pcall(speaker.playNote, "bit", 0.6, 14)
+end
+
+local function sfxPing(hasThreats)
+    if not speaker or not soundEnabled then return end
+    if hasThreats then
+        pcall(speaker.playNote, "pling", 0.8, 16)
+    else
+        pcall(speaker.playNote, "bit", 0.15, 6)
+    end
+end
+
+local function sfxAlertKlaxon(highTone)
+    if not speaker or not soundEnabled then return end
+    pcall(speaker.playNote, "didgeridoo", 1.5, highTone and 10 or 6)
+    pcall(speaker.playNote, "bell", 1.0, highTone and 14 or 10)
+end
+
+local function sfxCiwsBurst()
+    if not speaker or not soundEnabled then return end
+    pcall(speaker.playSound, "entity.generic.explode", 0.35, 1.8)
+    pcall(speaker.playNote, "snare", 0.9, 20)
+end
+
+local function sfxLaunch()
+    if not speaker or not soundEnabled then return end
+    pcall(speaker.playSound, "entity.firework_rocket.launch", 2.0, 0.7)
+    pcall(speaker.playNote, "chime", 1.5, 12)
+end
+
+local function sfxDefenseToggle(enabled)
+    if not speaker or not soundEnabled then return end
+    if enabled then
+        pcall(speaker.playNote, "pling", 1.0, 12)
+        pcall(speaker.playNote, "pling", 1.0, 18)
+    else
+        pcall(speaker.playNote, "bass", 1.0, 10)
+        pcall(speaker.playNote, "bass", 1.0, 4)
+    end
+end
+
+--------------------------------------------------------------------------------
+-- 3. Peripheral Discovery (Monitors, MCP, Wireless Modem)
+-- Automatically picks the taller monitor as Main Radar and shorter (4x2) as Keypad Deck
+--------------------------------------------------------------------------------
+local allMonitors = {}
 for _, name in ipairs(peripheral.getNames()) do
-    if peripheral.getType(name) == "monitor" and name ~= MONITOR_NAME then
-        local wrapped = peripheral.wrap(name)
-        if wrapped and wrapped ~= mon then
-            keyMon = wrapped
-            keyMonName = name
-            keyMon.setTextScale(1)
-            break
+    if peripheral.getType(name) == "monitor" then
+        local m = peripheral.wrap(name)
+        if m then
+            m.setTextScale(1)
+            local mw, mh = m.getSize()
+            table.insert(allMonitors, { name = name, mon = m, w = mw, h = mh, area = mw * mh })
         end
     end
 end
 
--- Wireless / Ender Modem (optional but enables pocket_remote.lua)
+if #allMonitors == 0 then
+    error("No connected monitors found!")
+end
+
+-- Sort so the tallest/largest monitor is primary (mon) and the second is the 4x2 keypad (keyMon)
+table.sort(allMonitors, function(a, b)
+    if a.h ~= b.h then return a.h > b.h end
+    return a.area > b.area
+end)
+
+local mon        = allMonitors[1].mon
+local monName    = allMonitors[1].name
+local W, H       = mon.getSize()
+
+local keyMon     = allMonitors[2] and allMonitors[2].mon or nil
+local keyMonName = allMonitors[2] and allMonitors[2].name or nil
+
+-- Wireless / Ender Modem
 local modem = peripheral.find("modem", function(_, m)
     return m.isWireless and m.isWireless()
 end)
@@ -222,30 +281,46 @@ end
 ensureAuthenticated()
 
 --------------------------------------------------------------------------------
--- 3. Auto-Registration, Air Defense & Dispersed Launch Logic
+-- 4. Air Defense Toggle, Auto-Registration & Dispersed Launch Logic
 --------------------------------------------------------------------------------
-local defenseConfigured = false
-local function configureAirDefense(centerX, centerZ)
-    pcall(mcp.setDefenseMode, "AUTO")
-    pcall(mcp.setDefenseDoctrine, "MAXIMUM_DEFENSE")
-    pcall(mcp.setInterceptorLauncherMode, "BOTH")
-    pcall(mcp.setPursuitAuto, true)
+local defenseEnabled = true
 
-    pcall(mcp.upsertDefenseZone, {
-        name = "CIWS Defense Zone",
-        x = centerX,
-        z = centerZ,
-        radius = ZONE_RADIUS,
-        priority = "CRITICAL",
-        autoEngage = true,
-    })
-    defenseConfigured = true
+local function applyDefenseState(enabled, centerX, centerZ)
+    defenseEnabled = enabled
+    if enabled then
+        pcall(mcp.setDefenseMode, "AUTO")
+        pcall(mcp.setDefenseDoctrine, "MAXIMUM_DEFENSE")
+        pcall(mcp.setInterceptorLauncherMode, "BOTH")
+        pcall(mcp.setPursuitAuto, true)
+        if centerX and centerZ then
+            pcall(mcp.upsertDefenseZone, {
+                name = "CIWS Defense Zone",
+                x = centerX,
+                z = centerZ,
+                radius = ZONE_RADIUS,
+                priority = "CRITICAL",
+                autoEngage = true,
+            })
+        end
+        pcall(mcp.setDefenseZoneAutoEngage, "CIWS Defense Zone", true)
+    else
+        pcall(mcp.setDefenseMode, "HOLD_FIRE")
+        pcall(mcp.setPursuitAuto, false)
+        pcall(mcp.setDefenseZoneAutoEngage, "CIWS Defense Zone", false)
+        -- Also disable autoEngage on any other configured defense zones while defense is OFF
+        local okZ, zones = pcall(mcp.getDefenseZones)
+        if okZ and type(zones) == "table" then
+            for _, z in ipairs(zones) do
+                if z.id then pcall(mcp.setDefenseZoneAutoEngage, z.id, false) end
+            end
+        end
+    end
 end
 
 local function scanAndRegisterDevices(radius)
-    radius = math.max(1, math.min(64, tonumber(radius) or 64))
+    radius = max(1, min(64, tonumber(radius) or 64))
     if not mcp.scanAndRegister then
-        return false, "scanAndRegister not supported"
+        return false, "scanAndRegister unsupported"
     end
     local ok, res = pcall(mcp.scanAndRegister, radius)
     if ok and type(res) == "table" then
@@ -254,10 +329,8 @@ local function scanAndRegisterDevices(radius)
     return false, tostring(res or "Scan failed")
 end
 
--- Run an automatic scan on startup so nearby floor rockets/CIWS/radars link immediately
 scanAndRegisterDevices(64)
 
--- Strike options shared by main monitor, 4x2 keypad monitor, and terminal
 local FIRE_MODES = { "AUTO", "1", "2", "3", "4", "5", "6", "BIG_ONE", "CRUISE", "SALVO", "THOR" }
 local PROFILES   = { "HIGH_BALLISTIC", "LOW_TRAJECTORY", "TERRAIN_HUG" }
 local IMPACTS    = { "SURFACE", "AIRBURST", "BUNKER_BUSTER" }
@@ -271,10 +344,10 @@ local strikeCfg = {
     modeIdx = 1,
     profileIdx = 1,
     impactIdx = 1,
-    mainWindow = "RADAR", -- "RADAR" or "STRIKE" on monitor_0
-    activeInputField = "X", -- "X", "Y", "Z", "CNT", "SPR" for touch keypad
+    mainWindow = "RADAR", -- "RADAR", "STRIKE", or "DEFENSE"
+    activeInputField = "X", -- "X", "Y", "Z", "CNT", "SPR"
     inputBuffer = "",
-    lastStatus = "Click radar or [STRIKE] to aim",
+    lastStatus = "Tap [1:RDR][2:STRK][3:DEF]",
 }
 
 local GOLDEN_ANGLE = math.pi * (3 - math.sqrt(5))
@@ -319,7 +392,6 @@ local function executeLaunch(cmd)
     local impactMode = cmd.impactMode or "SURFACE"
     local delaySeconds = tonumber(cmd.delaySeconds) or 0
 
-    -- Project Thor Orbital Kinetic Strike support
     if fireMode == "THOR" then
         if not mcp.fireOrbitalStrike then
             return false, "Thor API unavailable"
@@ -336,6 +408,7 @@ local function executeLaunch(cmd)
             end
         end
         if dispatched > 0 then
+            sfxLaunch()
             return true, string.format("THOR STRIKE x%d (3.5s)", dispatched)
         end
         return false, tostring(lastErr or "No Thor rods available")
@@ -365,6 +438,7 @@ local function executeLaunch(cmd)
             end
         end
         if firedCount > 0 then
+            sfxLaunch()
             return true, string.format("FIRED %d (SPR %dm)", firedCount, spread)
         elseif lastErr then
             return false, tostring(lastErr)
@@ -390,6 +464,7 @@ local function executeLaunch(cmd)
 
     local okPlan, resPlan = pcall(mcp.executeFirePlan, missions, delaySeconds)
     if okPlan and resPlan then
+        sfxLaunch()
         return true, tostring(resPlan)
     end
 
@@ -403,13 +478,14 @@ local function executeLaunch(cmd)
         end
     end
     if firedCount > 0 then
+        sfxLaunch()
         return true, string.format("FIRED %d (SPR %dm)", firedCount, spread)
     end
     return false, tostring(lastErr or "Launch failed")
 end
 
 --------------------------------------------------------------------------------
--- 4. Custom Palette Setup (7 phosphor green shades + tactical blip & HUD colors)
+-- 5. Custom Palette Setup
 --------------------------------------------------------------------------------
 local SHADE_BLIT = {
     [0] = "f", -- Black (outside circle)
@@ -437,7 +513,7 @@ local function setupPalette(target)
     target.setPaletteColor(colors.cyan,      0x33DDFF) -- '9'
     target.setPaletteColor(colors.white,     0xE8FFE8) -- '0'
     target.setPaletteColor(colors.lightGray, 0x77AA77) -- '8'
-    target.setPaletteColor(colors.gray,      0x223822) -- '7'
+    target.setPaletteColor(colors.gray,      0x1E331E) -- '7'
 end
 
 setupPalette(mon)
@@ -445,19 +521,30 @@ mon.setBackgroundColor(colors.black)
 mon.clear()
 
 if keyMon then
+    setupPalette(keyMon)
     keyMon.setBackgroundColor(colors.black)
     keyMon.clear()
 end
 
 --------------------------------------------------------------------------------
--- 5. Subpixel Geometry (102x57 square subpixels on 51x19 monitor)
+-- 6. Subpixel Geometry (Shifted right of Left HUD so HUD never overlaps circle)
+-- Row 1 is reserved for the Top Screen Switcher Bar; Rows 2..H render the radar!
 --------------------------------------------------------------------------------
-local PW = W * 2
-local PH = H * 3
+local RDR_START_ROW = 2
+local RDR_H         = H - 1
+local PW            = W * 2
+local PH            = RDR_H * 3
 
-local CX = (PW + 1) / 2
+-- Reserve left 12 character columns (24 subpixels) for the Left HUD
+local LEFT_HUD_COLS = 12
+local LEFT_SUBPIX   = LEFT_HUD_COLS * 2
+local RIGHT_HUD_COLS = (W >= 48) and 11 or 0
+local RIGHT_SUBPIX   = RIGHT_HUD_COLS * 2
+
+local availPW = PW - LEFT_SUBPIX - RIGHT_SUBPIX
+local CX = LEFT_SUBPIX + (availPW + 1) / 2
 local CY = (PH + 1) / 2
-local RADIUS = floor(min(PW, PH) / 2) - 1 -- 27 subpixels on 51x19
+local RADIUS = floor(min(availPW, PH) / 2) - 1
 local NUM_RINGS = 4
 local NUM_SPOKES = 12
 local TRAIL_ARC = math.rad(65)
@@ -481,7 +568,7 @@ for py = 1, PH do
         local dist = sqrt(dx * dx + dy * dy)
         staticDist[py][px] = dist
 
-        if dist <= RADIUS + 0.45 then
+        if px > LEFT_SUBPIX and dist <= RADIUS + 0.45 then
             staticInside[py][px] = true
             local ang = (atan2(dx, -dy) + TWO_PI) % TWO_PI
             staticAngle[py][px] = ang
@@ -528,7 +615,7 @@ for py = 1, PH do
 end
 
 --------------------------------------------------------------------------------
--- 6. Live MCP State, CIWS Defense & Offensive Inventory
+-- 7. Live MCP State, CIWS Defense & Offensive Inventory
 --------------------------------------------------------------------------------
 local OFFENSIVE_NODE_TYPES = {
     PLACED_MISSILE = true,
@@ -566,7 +653,10 @@ local state = {
     flightCount = 0,
     engaging = false,
     targetInitialized = false,
+    defenseInitialized = false,
 }
+
+local klaxonFlip = false
 
 local function pollMcp()
     if not mcp.isAuthenticated() then return end
@@ -576,7 +666,7 @@ local function pollMcp()
 
     state.online = netInfo.networkOnline ~= false
     state.empTicks = netInfo.empRemainingTicks or 0
-    state.defenseMode = netInfo.defenseMode or "AUTO"
+    state.defenseMode = netInfo.defenseMode or (defenseEnabled and "AUTO" or "HOLD_FIRE")
     state.readyCiws = netInfo.readyCiws or 0
     state.ciwsAmmo = netInfo.ciwsAmmo or 0
     state.readyInterceptors = netInfo.readyInterceptors or 0
@@ -614,11 +704,11 @@ local function pollMcp()
         state.targetInitialized = true
     end
 
-    if not defenseConfigured or state.defenseMode ~= "AUTO" then
-        configureAirDefense(ox, oz)
+    if not state.defenseInitialized then
+        applyDefenseState(defenseEnabled, ox, oz)
+        state.defenseInitialized = true
     end
 
-    -- Count offensive missiles & launchers (including PLACED_MISSILE on floor)
     local readyMissiles = netInfo.readyMissiles or 0
     local launcherCount = netInfo.launcherCount or 0
     local placedCount = 0
@@ -649,7 +739,7 @@ local function pollMcp()
         local nodeOffCount, nodeReadySum, nodePlaced = 0, 0, 0
         for _, n in ipairs(nodes) do
             if n.type == "CIWS" and n.connected then
-                table.insert(ciwsNodes, { id = n.id, x = n.x or ox, z = n.z or oz, ammo = n.readyCount or 0 })
+                table.insert(ciwsNodes, { id = n.id, x = n.x or ox, z = n.z or oz, name = n.name or "CIWS", ammo = n.readyCount or 0 })
             end
             if OFFENSIVE_NODE_TYPES[n.type] and n.connected ~= false then
                 nodeOffCount = nodeOffCount + 1
@@ -679,7 +769,6 @@ local function pollMcp()
     end
     state.siloReady = siloReady
 
-    -- Space Assets (Satellites & Project Thor)
     if mcp.getThorStatus then
         local okThor, thor = pcall(mcp.getThorStatus)
         if okThor and type(thor) == "table" then
@@ -693,7 +782,6 @@ local function pollMcp()
         end
     end
 
-    -- Gather Radar Contacts, Tracks & Flights
     local blips = {}
     local threatList = {}
     local seenIds = {}
@@ -711,7 +799,7 @@ local function pollMcp()
                 end
                 local dx, dz = c.x - ox, c.z - oz
                 local dist = sqrt(dx * dx + dz * dz)
-                local isEngaged = (c.trackState == "ENGAGED") or (dist <= 200 and state.readyCiws > 0)
+                local isEngaged = defenseEnabled and ((c.trackState == "ENGAGED") or (dist <= 200 and state.readyCiws > 0))
                 if isEngaged then anyEngaging = true end
 
                 table.insert(blips, {
@@ -724,7 +812,7 @@ local function pollMcp()
                     x = floor(c.x), z = floor(c.z),
                     dist = floor(dist + 0.5),
                     eta = c.etaTicks and floor(c.etaTicks / 20) or nil,
-                    state = isEngaged and "CIWS FIRE" or (c.trackState or "TRACKING"),
+                    state = isEngaged and "CIWS FIRE" or (defenseEnabled and (c.trackState or "TRACKING") or "DEF OFF"),
                     color = "e",
                 })
             end
@@ -743,7 +831,7 @@ local function pollMcp()
                 local prio = isOwn and 2 or 4
                 local dx, dz = rc.x - ox, rc.z - oz
                 local dist = sqrt(dx * dx + dz * dz)
-                local isEngaged = (not isOwn) and (dist <= 200 and state.readyCiws > 0)
+                local isEngaged = defenseEnabled and (not isOwn) and (dist <= 200 and state.readyCiws > 0)
                 if isEngaged then anyEngaging = true end
 
                 table.insert(blips, {
@@ -758,7 +846,7 @@ local function pollMcp()
                         kind = "RKT T" .. tostring(rc.tier or "?"),
                         x = floor(rc.x), z = floor(rc.z),
                         dist = floor(dist + 0.5),
-                        state = isEngaged and "CIWS FIRE" or "INCOMING",
+                        state = isEngaged and "CIWS FIRE" or (defenseEnabled and "INCOMING" or "DEF OFF"),
                         color = "e",
                     })
                 end
@@ -766,9 +854,18 @@ local function pollMcp()
         end
     end
 
-    if state.threatCount > 0 or #engageIds > 0 then
+    -- Only engage threats when Defense is ON!
+    if defenseEnabled and (state.threatCount > 0 or #engageIds > 0) then
         local okEng, launched = pcall(mcp.engageThreat)
         if okEng and launched then anyEngaging = true end
+    end
+
+    -- Play speaker alerts when threats or CIWS fire are active
+    if anyEngaging then
+        sfxCiwsBurst()
+    elseif state.threatCount > 0 then
+        klaxonFlip = not klaxonFlip
+        sfxAlertKlaxon(klaxonFlip)
     end
 
     local okTracks, tracks = pcall(mcp.getTracks)
@@ -822,7 +919,6 @@ local function pollMcp()
     state.engaging = anyEngaging
 end
 
--- Build compact status + radar snapshot for pocket_remote.lua
 local function buildRemoteStatusPayload()
     local compactBlips = {}
     for i = 1, min(#state.blips, 24) do
@@ -851,6 +947,7 @@ local function buildRemoteStatusPayload()
 
     return {
         online = state.online,
+        defenseEnabled = defenseEnabled,
         originX = state.originX,
         originY = state.originY,
         originZ = state.originZ,
@@ -872,7 +969,7 @@ local function buildRemoteStatusPayload()
 end
 
 --------------------------------------------------------------------------------
--- 7. Subpixel Framebuffer Rendering & Coordinate Conversion
+-- 8. Subpixel Framebuffer Rendering & Coordinate Conversion
 --------------------------------------------------------------------------------
 local tickCounter = 0
 
@@ -914,10 +1011,11 @@ local function worldToSubpixel(wx, wz)
     return bx, by
 end
 
--- Convert a monitor character click (charX, charY) inside the radar circle into world (X, Z)
 local function monitorClickToWorld(charX, charY)
+    local relRow = charY - RDR_START_ROW + 1
+    if relRow < 1 or relRow > RDR_H then return nil, nil end
     local px = (charX - 0.5) * 2
-    local py = (charY - 0.5) * 3
+    local py = (relRow - 0.5) * 3
     local dx = px - CX
     local dy = py - CY
     local dist = sqrt(dx * dx + dy * dy)
@@ -987,7 +1085,6 @@ local function updateFramebuffer(sweepAngle)
         end
     end
 
-    -- Draw selected Strike Target crosshair (+) on the radar map in orange/white
     local tx, tz = worldToSubpixel(strikeCfg.targetX, strikeCfg.targetZ)
     local blinkCol = (tickCounter % 8 < 4) and "1" or "0"
     setOverlayPixel(tx - 1, tz, blinkCol, 3)
@@ -995,20 +1092,18 @@ local function updateFramebuffer(sweepAngle)
     setOverlayPixel(tx, tz - 1, blinkCol, 3)
     setOverlayPixel(tx, tz + 1, blinkCol, 3)
 
-    -- Plot connected CIWS turrets
     for _, ciws in ipairs(state.ciwsNodes) do
         local cx, cy = worldToSubpixel(ciws.x, ciws.z)
         setOverlayPixel(cx, cy, "9", 2)
     end
 
-    -- Plot live radar blips & CIWS tracers
     local pulseOn = (tickCounter % 6) < 4
     local tracerPhase = tickCounter % 3
 
     for _, blip in ipairs(state.blips) do
         local bx, by = worldToSubpixel(blip.x, blip.z)
 
-        if blip.engaged and state.readyCiws > 0 then
+        if blip.engaged and defenseEnabled and state.readyCiws > 0 then
             local sx, sy = floor(CX + 0.5), floor(CY + 0.5)
             if #state.ciwsNodes > 0 then
                 sx, sy = worldToSubpixel(state.ciwsNodes[1].x, state.ciwsNodes[1].z)
@@ -1038,7 +1133,7 @@ local function updateFramebuffer(sweepAngle)
 end
 
 --------------------------------------------------------------------------------
--- 8. Main Monitor Rendering (Window 1: RADAR + Quick Launch | Window 2: STRIKE KEYPAD)
+-- 9. UI Rendering for Main Monitor & 4x2 Lower Keypad Deck
 --------------------------------------------------------------------------------
 local function writeHud(target, x, y, text, fg, bg)
     bg = bg or string.rep("f", #text)
@@ -1054,19 +1149,54 @@ local function padRight(str, len)
     return str .. string.rep(" ", len - #str)
 end
 
-local function drawStrikeKeypadPanel(target, tw, th, isMainMonitor)
+-- Top Row Tab Bar on Main Monitor (Row 1): Always visible so switching screens is effortless!
+local function drawMainTabBar()
+    writeHud(mon, 1, 1, string.rep(" ", W), "0", "7")
+    local w1 = (strikeCfg.mainWindow == "RADAR")
+    local w2 = (strikeCfg.mainWindow == "STRIKE")
+    local w3 = (strikeCfg.mainWindow == "DEFENSE")
+
+    writeHud(mon, 1,  1, w1 and "[1:RADAR]"   or " 1:RADAR ",   w1 and "f" or "0", w1 and "5" or "7")
+    writeHud(mon, 11, 1, w2 and "[2:STRIKE]"  or " 2:STRIKE ",  w2 and "f" or "0", w2 and "4" or "7")
+    writeHud(mon, 22, 1, w3 and "[3:DEFENSE]" or " 3:DEFENSE ", w3 and "f" or "0", w3 and "9" or "7")
+
+    if W >= 39 then
+        if defenseEnabled then
+            writeHud(mon, W - 9, 1, "[DEF: ON ]", "f", "5")
+        else
+            writeHud(mon, W - 9, 1, "[DEF: OFF]", "0", "e")
+        end
+    end
+end
+
+-- Dedicated 4x2 Keypad Deck Renderer (Zero overlap on 39x12 monitors!)
+local function drawKeypadDeck(target, tw, th, isMainMonitor)
     target.setBackgroundColor(colors.black)
     target.clear()
 
-    -- Top Header / Window Switcher
     if isMainMonitor then
-        writeHud(target, 1, 1, padRight(" ECLIPSE STRIKE & KEYPAD CONSOLE", tw - 12), "f", "5")
-        writeHud(target, tw - 11, 1, "[<< RADAR]  ", "0", "7")
+        drawMainTabBar()
     else
-        writeHud(target, 1, 1, padRight(" ECLIPSE KEYPAD", tw), "f", "5")
+        -- Row 1 on the 4x2 Keypad Monitor: Screen Switcher Tabs for the Main Screen + Audio Mute
+        writeHud(target, 1, 1, string.rep(" ", tw), "0", "7")
+        local w1 = (strikeCfg.mainWindow == "RADAR")
+        local w2 = (strikeCfg.mainWindow == "STRIKE")
+        local w3 = (strikeCfg.mainWindow == "DEFENSE")
+        writeHud(target, 1,  1, "SCR:", "8", "7")
+        writeHud(target, 6,  1, w1 and "[1:RDR]"  or " 1:RDR ",  w1 and "f" or "0", w1 and "5" or "7")
+        writeHud(target, 14, 1, w2 and "[2:STRK]" or " 2:STRK ", w2 and "f" or "0", w2 and "4" or "7")
+        writeHud(target, 23, 1, w3 and "[3:DEF]"  or " 3:DEF ",  w3 and "f" or "0", w3 and "9" or "7")
+        writeHud(target, 32, 1, soundEnabled and "[SFX:ON]" or "[SFX:OF]", soundEnabled and "5" or "8", "7")
     end
 
-    -- Left Column: Field Selector & Current Values
+    -- Row 2 (Left): Big Defense Enable / Disable Toggle Button
+    if defenseEnabled then
+        writeHud(target, 2, 2, "[DEFENSE: AUTO ON ]  ", "f", "5")
+    else
+        writeHud(target, 2, 2, "[DEFENSE: HOLD/OFF]  ", "0", "e")
+    end
+
+    -- Rows 3..7 (Left Cols 2..22): Coordinate & Salvo Fields
     local fields = {
         { id = "X",   label = "TGT X :", val = tostring(strikeCfg.targetX), row = 3 },
         { id = "Y",   label = "TGT Y :", val = tostring(strikeCfg.targetY), row = 4 },
@@ -1076,64 +1206,79 @@ local function drawStrikeKeypadPanel(target, tw, th, isMainMonitor)
     }
 
     for _, f in ipairs(fields) do
-        if f.row <= th then
-            local active = (strikeCfg.activeInputField == f.id)
-            local shownVal = (active and strikeCfg.inputBuffer ~= "") and (strikeCfg.inputBuffer .. "_") or f.val
-            local line = string.format("[%s] %-7s %-8s", f.id:sub(1, 1), f.label, shownVal)
-            writeHud(target, 2, f.row, padRight(line, 21), active and "4" or "0", active and "7" or "f")
-        end
+        local active = (strikeCfg.activeInputField == f.id)
+        local shownVal = (active and strikeCfg.inputBuffer ~= "") and (strikeCfg.inputBuffer .. "_") or f.val
+        local line = string.format("[%s] %-7s %-8s", f.id:sub(1, 1), f.label, shownVal)
+        writeHud(target, 2, f.row, padRight(line, 21), active and "4" or "0", active and "7" or "f")
     end
 
-    -- Mode / Profile / Impact cyclers
-    if th >= 11 then
-        local modeName = FIRE_MODES[strikeCfg.modeIdx]
-        local profName = PROFILES[strikeCfg.profileIdx]
-        local impName  = IMPACTS[strikeCfg.impactIdx]
-        writeHud(target, 2, 9,  padRight("MODE: [" .. modeName .. "]", 21), "4", "7")
-        writeHud(target, 2, 10, padRight("PROF: [" .. profName:sub(1, 12) .. "]", 21), "9", "7")
-        writeHud(target, 2, 11, padRight("IMPT: [" .. impName:sub(1, 12) .. "]", 21), "1", "7")
-    end
+    -- Row 8 & Row 9 (Left Cols 2..22): Mode, Profile, Link 64m & Silo Arm
+    local modeName = FIRE_MODES[strikeCfg.modeIdx]
+    local profName = PROFILES[strikeCfg.profileIdx]
+    writeHud(target, 2,  8, padRight("[M:" .. modeName:sub(1, 7) .. "]", 11), "4", "7")
+    writeHud(target, 14, 8, "[LINK 64m]", "f", "9")
 
-    if th >= 14 then
-        writeHud(target, 2, 13, "[SCAN & LINK 64m]    ", "f", "9")
-        writeHud(target, 2, 14, "[ARM STRATEGIC SILO] ", "f", "1")
-    end
+    writeHud(target, 2,  9, padRight("[P:" .. profName:sub(1, 7) .. "]", 11), "9", "7")
+    writeHud(target, 14, 9, "[ARM SILO]", "f", "1")
 
-    if th >= 17 then
-        writeHud(target, 2, 16, "=====================", "e", "f")
-        writeHud(target, 2, 17, " >>> LAUNCH STRIKE <<<", "0", "e")
-        writeHud(target, 2, 18, "=====================", "e", "f")
-    elseif th >= 12 then
-        -- Compact layout for 4x2 monitor (39x12)
-        writeHud(target, 2, 8,  "[MODE:" .. FIRE_MODES[strikeCfg.modeIdx]:sub(1, 6) .. "]", "4", "7")
-        writeHud(target, 16, 8, "[LINK 64m]", "f", "9")
-        writeHud(target, 2, 10, " >>> LAUNCH STRIKE <<< ", "0", "e")
+    -- Row 10 & 11 (Left Cols 2..22): Launch Strike Button
+    writeHud(target, 2, 10, " >>> LAUNCH STRIKE <<<", "0", "e")
+    if th >= 12 then
+        writeHud(target, 2, 11, string.format(" MSLS:%-2d  CIWS:%d/%d ", state.readyMissiles, state.readyCiws, state.ciwsAmmo), "8", "f")
         writeHud(target, 2, 12, padRight(strikeCfg.lastStatus, tw - 2), "5", "f")
     end
 
-    if th >= 19 then
-        writeHud(target, 2, 19, padRight(strikeCfg.lastStatus, tw - 2), "5", "f")
-    end
+    -- Right Side (Cols 24..38, 15 chars wide): Crisp Touch Numeric Keypad (Never clips on 39-wide screen!)
+    local kx = min(24, max(16, tw - 15))
+    writeHud(target, kx, 2, "== TOUCH PAD ==", "5", "f")
+    writeHud(target, kx, 3, "[ 7 ][ 8 ][ 9 ]", "0", "7")
+    writeHud(target, kx, 5, "[ 4 ][ 5 ][ 6 ]", "0", "7")
+    writeHud(target, kx, 7, "[ 1 ][ 2 ][ 3 ]", "0", "7")
+    writeHud(target, kx, 9, "[ - ][ 0 ][CLR]", "4", "7")
+    writeHud(target, kx, 11, "[ APPLY / SET ]", "f", "5")
+end
 
-    -- Right Column: On-Screen Touch Numeric Keypad (Cols 25..39)
-    local kx = min(25, max(16, tw - 14))
-    writeHud(target, kx, 2, "TOUCH KEYPAD ", "5", "f")
-    writeHud(target, kx, 3, "[ 7 ] [ 8 ] [ 9 ]", "0", "7")
-    writeHud(target, kx, 5, "[ 4 ] [ 5 ] [ 6 ]", "0", "7")
-    writeHud(target, kx, 7, "[ 1 ] [ 2 ] [ 3 ]", "0", "7")
-    writeHud(target, kx, 9, "[ - ] [ 0 ] [CLR]", "4", "7")
-    writeHud(target, kx, 11, "[  APPLY / SET  ]", "f", "5")
+-- Window 3 on Main Monitor: Air Defense, CIWS & Node Control Screen
+local function drawDefenseScreen(target, tw, th)
+    target.setBackgroundColor(colors.black)
+    target.clear()
+    drawMainTabBar()
+
+    writeHud(target, 2, 3, "=== AIR DEFENSE & CIWS CONTROL ===", "5", "f")
+
+    if defenseEnabled then
+        writeHud(target, 2, 5, " STATUS: [ DEFENSE ACTIVE (AUTO) ]  ", "f", "5")
+    else
+        writeHud(target, 2, 5, " STATUS: [ DEFENSE DISABLED (OFF) ] ", "0", "e")
+    end
+    writeHud(target, 2, 6, " (Tap status button above to toggle CIWS & Interceptors)", "8", "f")
+
+    writeHud(target, 2, 8,  string.format(" Connected CIWS Turrets : %d", state.readyCiws), "0", "f")
+    writeHud(target, 2, 9,  string.format(" Total CIWS Ammunition  : %d rounds", state.ciwsAmmo), "4", "f")
+    writeHud(target, 2, 10, string.format(" Ready Interceptors     : %d missiles", state.readyInterceptors), "9", "f")
+    writeHud(target, 2, 11, string.format(" Ready Offensive Msls   : %d (%d Floor)", state.readyMissiles, state.placedCount), "0", "f")
+    writeHud(target, 2, 12, string.format(" Project Thor Rods      : %d | Satellites: %d", state.thorRods, state.satCount), "4", "f")
+
+    writeHud(target, 2, 14, "[ SCAN & REGISTER ALL NEARBY NODES (64m) ]", "f", "9")
+    writeHud(target, 2, 16, soundEnabled and "[ SPEAKER_0 AUDIO: ENABLED  ]" or "[ SPEAKER_0 AUDIO: MUTED    ]", "f", soundEnabled and "5" or "7")
+    writeHud(target, 2, 18, padRight("Last: " .. tostring(strikeCfg.lastStatus), tw - 2), "8", "f")
 end
 
 local function drawMainMonitor()
     if strikeCfg.mainWindow == "STRIKE" then
-        drawStrikeKeypadPanel(mon, W, H, true)
+        drawKeypadDeck(mon, W, H, true)
+        return
+    elseif strikeCfg.mainWindow == "DEFENSE" then
+        drawDefenseScreen(mon, W, H)
         return
     end
 
-    -- Window 1: Subpixel Radar Scope + Left/Right Tactical & Launch HUD
-    for cy = 1, H do
-        local py0 = (cy - 1) * 3 + 1
+    -- Window 1: RADAR VIEW
+    drawMainTabBar()
+
+    for r = 1, RDR_H do
+        local cy = RDR_START_ROW + r - 1
+        local py0 = (r - 1) * 3 + 1
         local row1, row2, row3 = fb[py0], fb[py0 + 1], fb[py0 + 2]
         local ov1, ov2, ov3 = overlay[py0], overlay[py0 + 1], overlay[py0 + 2]
         local pr1, pr2, pr3 = overlayPrio[py0], overlayPrio[py0 + 1], overlayPrio[py0 + 2]
@@ -1220,68 +1365,65 @@ local function drawMainMonitor()
         mon.blit(table.concat(chars), table.concat(fgs), table.concat(bgs))
     end
 
-    -- Left HUD Margin (Cols 1..11): Defense, Inventory & Direct Launch Controls
-    writeHud(mon, 1, 1, "ECLIPSE RDR", "5")
-    if state.online then
-        writeHud(mon, 2, 2, "ONLINE", "5")
+    -- Left HUD Margin (Cols 1..11, never overlaps radar circle!)
+    writeHud(mon, 1, 2, state.online and "NET: ONLINE" or "NET: EMP!  ", state.online and "5" or "e")
+    writeHud(mon, 1, 3, padRight("CIWS:" .. state.readyCiws .. "/" .. state.ciwsAmmo, 11), state.readyCiws > 0 and "5" or "e")
+    writeHud(mon, 1, 4, padRight("MSLS:" .. state.readyMissiles .. " RDY", 11), state.readyMissiles > 0 and "0" or "e")
+    writeHud(mon, 1, 5, padRight("RNG :" .. state.radarRange .. "m", 11), "8")
+
+    -- Prominent Defense Toggle Button on Row 7
+    if defenseEnabled then
+        if state.threatCount > 0 then
+            local flash = (tickCounter % 4 < 2)
+            writeHud(mon, 1, 7, "[CIWS FIRE]", flash and "f" or "0", flash and "4" or "e")
+        else
+            writeHud(mon, 1, 7, "[DEF: ON ] ", "f", "5")
+        end
     else
-        writeHud(mon, 2, 2, "EMP!  ", "e")
-    end
-    writeHud(mon, 1, 3, padRight("CIWS:" .. state.readyCiws .. "/" .. state.ciwsAmmo, 11), state.readyCiws > 0 and "77777555555" or "77777eeeeee")
-    writeHud(mon, 1, 4, padRight("MSLS:" .. state.readyMissiles .. " RDY", 11), state.readyMissiles > 0 and "77777000000" or "77777eeeeee")
-    if state.thorRods > 0 then
-        writeHud(mon, 1, 5, padRight("THOR:" .. state.thorRods .. " ROD", 11), "77777444444")
-    else
-        writeHud(mon, 1, 5, padRight("RNG :" .. state.radarRange .. "m", 11), "77777888888")
+        writeHud(mon, 1, 7, "[DEF: OFF] ", "0", "e")
     end
 
-    if state.threatCount > 0 then
-        local flash = (tickCounter % 4 < 2)
-        writeHud(mon, 1, 7, "CIWS ACTIVE", flash and "4" or "e")
-    else
-        writeHud(mon, 1, 7, "CIWS SENTRY", "5")
-    end
-
-    -- Main-Screen Interactive Strike Controls (Rows 9..19, Cols 1..11)
+    -- Strike & Navigation Buttons on Left HUD (Rows 9..19)
     writeHud(mon, 1, 9,  "[LINK 64m] ", "f", "9")
     writeHud(mon, 1, 10, padRight("X:" .. strikeCfg.targetX, 11), "0")
     writeHud(mon, 1, 11, padRight("Z:" .. strikeCfg.targetZ, 11), "0")
-    writeHud(mon, 1, 12, padRight(string.format("C:%-2d [-] [+]", strikeCfg.count), 11), "4")
-    writeHud(mon, 1, 13, padRight(string.format("S:%-2d [-] [+]", strikeCfg.spread), 11), "8")
+    writeHud(mon, 1, 12, padRight(string.format("C:%-2d [-][+]", strikeCfg.count), 11), "4")
+    writeHud(mon, 1, 13, padRight(string.format("S:%-2d [-][+]", strikeCfg.spread), 11), "8")
     writeHud(mon, 1, 14, padRight("M:" .. FIRE_MODES[strikeCfg.modeIdx]:sub(1, 9), 11), "9")
-    writeHud(mon, 1, 16, "[KEYPAD/XY]", "f", "4")
+    writeHud(mon, 1, 16, "[2:KEYPAD] ", "f", "4")
     writeHud(mon, 1, 18, "[>>FIRE!<<]", "0", "e")
     writeHud(mon, 1, 19, padRight(strikeCfg.lastStatus:sub(1, 11), 11), "8")
 
-    -- Right HUD Margin (Cols 41..51): Live Contacts (Tap contact row to lock target!)
-    writeHud(mon, 41, 1, "CONTACTS   ", "5")
-    if #state.threatList == 0 then
-        writeHud(mon, 41, 2, "SECTOR CLR ", "8")
-    else
-        local maxRows = min(#state.threatList, 5)
-        for i = 1, maxRows do
-            local item = state.threatList[i]
-            local baseRow = 2 + (i - 1) * 3
-            local line1 = padRight(string.format("%s %dm", item.kind, item.dist), 11)
-            writeHud(mon, 41, baseRow, line1, item.color)
-
-            local statusStr = item.state or "TRACKING"
-            if item.eta then
-                statusStr = string.format("%s %ds", statusStr:sub(1, 6), item.eta)
+    -- Right HUD Margin (only if monitor is wide enough, e.g. 51x19)
+    if RIGHT_HUD_COLS > 0 then
+        local rx = W - RIGHT_HUD_COLS + 1
+        writeHud(mon, rx, 2, "CONTACTS   ", "5")
+        if #state.threatList == 0 then
+            writeHud(mon, rx, 3, "SECTOR CLR ", "8")
+        else
+            local maxRows = min(#state.threatList, 5)
+            for i = 1, maxRows do
+                local item = state.threatList[i]
+                local baseRow = 3 + (i - 1) * 3
+                writeHud(mon, rx, baseRow, padRight(string.format("%s %dm", item.kind, item.dist), 11), item.color)
+                local statusStr = item.state or "TRACKING"
+                if item.eta then statusStr = string.format("%s %ds", statusStr:sub(1, 6), item.eta) end
+                writeHud(mon, rx, baseRow + 1, padRight(" " .. statusStr, 11), (item.state == "CIWS FIRE") and "4" or "8")
             end
-            local stColor = (item.state == "CIWS FIRE") and "4" or "8"
-            writeHud(mon, 41, baseRow + 1, padRight(" " .. statusStr, 11), stColor)
         end
+        writeHud(mon, rx, 19, padRight("THR:" .. state.threatCount .. " FLT:" .. state.flightCount, 11), "9")
     end
-
-    writeHud(mon, 41, 17, "TAP RADAR  ", "8")
-    writeHud(mon, 41, 18, "TO AIM X/Z ", "8")
-    writeHud(mon, 41, 19, padRight("THR:" .. state.threatCount .. " FLT:" .. state.flightCount, 11), "9")
 end
 
 --------------------------------------------------------------------------------
--- 9. Touch Handler for Main Monitor & Optional 4x2 Keypad Monitor
+-- 10. Touch Handlers for Main Monitor & 4x2 Keypad Deck
 --------------------------------------------------------------------------------
+local function toggleDefense()
+    applyDefenseState(not defenseEnabled, state.originX, state.originZ)
+    sfxDefenseToggle(defenseEnabled)
+    strikeCfg.lastStatus = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
+end
+
 local function applyKeypadBuffer()
     local num = tonumber(strikeCfg.inputBuffer)
     if num then
@@ -1296,54 +1438,97 @@ local function applyKeypadBuffer()
     strikeCfg.inputBuffer = ""
 end
 
-local function handleKeypadMonitorTouch(tw, th, x, y, isMainMonitor)
-    if isMainMonitor and y == 1 and x >= tw - 11 then
-        applyKeypadBuffer()
-        strikeCfg.mainWindow = "RADAR"
+local function handleTopTabTouch(x, isKeypadMonitor, tw)
+    if isKeypadMonitor then
+        if x >= 6 and x <= 13 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
+        elseif x >= 14 and x <= 22 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
+        elseif x >= 23 and x <= 30 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
+        elseif x >= 31 then
+            soundEnabled = not soundEnabled
+            sfxClick()
+            strikeCfg.lastStatus = soundEnabled and "AUDIO: ON" or "AUDIO: MUTED"
+            return true
+        end
+    else
+        if x >= 1 and x <= 10 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "RADAR"; return true
+        elseif x >= 11 and x <= 21 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "STRIKE"; return true
+        elseif x >= 22 and x <= 33 then
+            sfxClick(); applyKeypadBuffer(); strikeCfg.mainWindow = "DEFENSE"; return true
+        elseif tw >= 39 and x >= tw - 9 then
+            toggleDefense(); return true
+        end
+    end
+    return false
+end
+
+local function handleKeypadTouch(tw, th, x, y, isMainMonitor)
+    if y == 1 then
+        handleTopTabTouch(x, not isMainMonitor, tw)
         return
     end
 
-    -- Field selection (Left side rows 3..7)
+    -- Row 2 Left: Defense ON/OFF Toggle
+    if y == 2 and x <= 22 then
+        toggleDefense()
+        return
+    end
+
+    -- Rows 3..7 Left: Field selection
     local fieldByRow = { [3] = "X", [4] = "Y", [5] = "Z", [6] = "CNT", [7] = "SPR" }
     if x <= 22 and fieldByRow[y] then
+        sfxClick()
         applyKeypadBuffer()
         strikeCfg.activeInputField = fieldByRow[y]
         strikeCfg.inputBuffer = ""
         return
     end
 
-    -- Numeric keypad (Right side cols kx..kx+16)
-    local kx = min(25, max(16, tw - 14))
+    -- Right Side Cols kx..kx+14: Numeric Keypad ([ 7 ][ 8 ][ 9 ] = 5 chars per button)
+    local kx = min(24, max(16, tw - 15))
     if x >= kx then
-        local colIdx = floor((x - kx) / 6) + 1 -- 1, 2, or 3
+        local colIdx = floor((x - kx) / 5) + 1 -- 1, 2, or 3
         local keyPressed = nil
-        if y == 3 then keyPressed = ({ "7", "8", "9" })[colIdx]
-        elseif y == 5 then keyPressed = ({ "4", "5", "6" })[colIdx]
-        elseif y == 7 then keyPressed = ({ "1", "2", "3" })[colIdx]
-        elseif y == 9 then keyPressed = ({ "-", "0", "CLR" })[colIdx]
+        if y == 3 or y == 4 then keyPressed = ({ "7", "8", "9" })[colIdx]
+        elseif y == 5 or y == 6 then keyPressed = ({ "4", "5", "6" })[colIdx]
+        elseif y == 7 or y == 8 then keyPressed = ({ "1", "2", "3" })[colIdx]
+        elseif y == 9 or y == 10 then keyPressed = ({ "-", "0", "CLR" })[colIdx]
         elseif y == 11 then keyPressed = "ENTER" end
 
         if keyPressed == "CLR" then
+            sfxKey()
             strikeCfg.inputBuffer = ""
         elseif keyPressed == "ENTER" then
+            sfxClick()
             applyKeypadBuffer()
         elseif keyPressed == "-" then
+            sfxKey()
             if strikeCfg.inputBuffer == "" then strikeCfg.inputBuffer = "-" end
         elseif keyPressed then
+            sfxKey()
             strikeCfg.inputBuffer = strikeCfg.inputBuffer .. keyPressed
         end
         return
     end
 
-    -- Mode / Profile / Impact / Action buttons on Left side
-    if th >= 17 then
-        if y == 9 then strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
-        elseif y == 10 then strikeCfg.profileIdx = (strikeCfg.profileIdx % #PROFILES) + 1
-        elseif y == 11 then strikeCfg.impactIdx = (strikeCfg.impactIdx % #IMPACTS) + 1
-        elseif y == 13 then
-            local ok, msg = scanAndRegisterDevices(64)
+    -- Left Side Rows 8..11: Mode, Link 64m, Profile, Arm Silo, Launch Strike
+    if y == 8 then
+        sfxClick()
+        if x < 14 then
+            strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
+        else
+            local _, msg = scanAndRegisterDevices(64)
             strikeCfg.lastStatus = msg
-        elseif y == 14 then
+        end
+    elseif y == 9 then
+        sfxClick()
+        if x < 14 then
+            strikeCfg.profileIdx = (strikeCfg.profileIdx % #PROFILES) + 1
+        else
             local armed = 0
             local okS, silos = pcall(mcp.getSilos)
             if okS and type(silos) == "table" then
@@ -1353,64 +1538,72 @@ local function handleKeypadMonitorTouch(tw, th, x, y, isMainMonitor)
                 end
             end
             strikeCfg.lastStatus = string.format("ARMED %d SILO(S)", armed)
-        elseif y >= 16 and y <= 18 then
-            applyKeypadBuffer()
-            local ok, msg = executeLaunch({
-                x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
-                count = strikeCfg.count, spread = strikeCfg.spread,
-                fireMode = FIRE_MODES[strikeCfg.modeIdx],
-                attackProfile = PROFILES[strikeCfg.profileIdx],
-                impactMode = IMPACTS[strikeCfg.impactIdx],
-            })
-            strikeCfg.lastStatus = msg
         end
-    else
-        -- Compact 4x2 monitor buttons
-        if y == 8 and x < 15 then
-            strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
-        elseif y == 8 and x >= 15 then
-            local _, msg = scanAndRegisterDevices(64)
-            strikeCfg.lastStatus = msg
-        elseif y >= 10 and y <= 11 then
-            applyKeypadBuffer()
-            local _, msg = executeLaunch({
-                x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
-                count = strikeCfg.count, spread = strikeCfg.spread,
-                fireMode = FIRE_MODES[strikeCfg.modeIdx],
-                attackProfile = PROFILES[strikeCfg.profileIdx],
-                impactMode = IMPACTS[strikeCfg.impactIdx],
-            })
-            strikeCfg.lastStatus = msg
-        end
+    elseif y == 10 then
+        applyKeypadBuffer()
+        local _, msg = executeLaunch({
+            x = strikeCfg.targetX, y = strikeCfg.targetY, z = strikeCfg.targetZ,
+            count = strikeCfg.count, spread = strikeCfg.spread,
+            fireMode = FIRE_MODES[strikeCfg.modeIdx],
+            attackProfile = PROFILES[strikeCfg.profileIdx],
+            impactMode = IMPACTS[strikeCfg.impactIdx],
+        })
+        strikeCfg.lastStatus = msg
+    end
+end
+
+local function handleDefenseScreenTouch(x, y)
+    if y == 1 then
+        handleTopTabTouch(x, false, W)
+        return
+    elseif y == 5 or y == 6 then
+        toggleDefense()
+    elseif y == 14 then
+        sfxClick()
+        local _, msg = scanAndRegisterDevices(64)
+        strikeCfg.lastStatus = msg
+    elseif y == 16 then
+        soundEnabled = not soundEnabled
+        sfxClick()
+        strikeCfg.lastStatus = soundEnabled and "AUDIO: ENABLED" or "AUDIO: MUTED"
     end
 end
 
 local function handleMainRadarTouch(x, y)
     if strikeCfg.mainWindow == "STRIKE" then
-        handleKeypadMonitorTouch(W, H, x, y, true)
+        handleKeypadTouch(W, H, x, y, true)
+        return
+    elseif strikeCfg.mainWindow == "DEFENSE" then
+        handleDefenseScreenTouch(x, y)
         return
     end
 
-    -- Left HUD buttons (Cols 1..11)
-    if x <= 11 then
-        if y == 9 then
+    if y == 1 then
+        handleTopTabTouch(x, false, W)
+        return
+    end
+
+    -- Left HUD buttons (Cols 1..12)
+    if x <= LEFT_HUD_COLS then
+        if y == 7 then
+            toggleDefense()
+        elseif y == 9 then
+            sfxClick()
             local _, msg = scanAndRegisterDevices(64)
             strikeCfg.lastStatus = msg
         elseif y == 10 or y == 11 or y == 16 then
+            sfxClick()
             strikeCfg.mainWindow = "STRIKE"
         elseif y == 12 then
-            if x >= 6 and x <= 8 then
-                strikeCfg.count = max(1, strikeCfg.count - 1)
-            elseif x >= 9 then
-                strikeCfg.count = min(64, strikeCfg.count + 1)
-            end
+            sfxClick()
+            if x <= 8 then strikeCfg.count = max(1, strikeCfg.count - 1)
+            else strikeCfg.count = min(64, strikeCfg.count + 1) end
         elseif y == 13 then
-            if x >= 6 and x <= 8 then
-                strikeCfg.spread = max(0, strikeCfg.spread - 4)
-            elseif x >= 9 then
-                strikeCfg.spread = min(256, strikeCfg.spread + 4)
-            end
+            sfxClick()
+            if x <= 8 then strikeCfg.spread = max(0, strikeCfg.spread - 4)
+            else strikeCfg.spread = min(256, strikeCfg.spread + 4) end
         elseif y == 14 then
+            sfxClick()
             strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
         elseif y == 18 then
             local _, msg = executeLaunch({
@@ -1425,11 +1618,12 @@ local function handleMainRadarTouch(x, y)
         return
     end
 
-    -- Right HUD: Tap a threat contact row to lock its coordinates!
-    if x >= 41 then
-        local idx = floor((y - 2) / 3) + 1
+    -- Right HUD contact lock
+    if RIGHT_HUD_COLS > 0 and x >= (W - RIGHT_HUD_COLS + 1) then
+        local idx = floor((y - 3) / 3) + 1
         local item = state.threatList[idx]
         if item and item.x and item.z then
+            sfxClick()
             strikeCfg.targetX = item.x
             strikeCfg.targetZ = item.z
             strikeCfg.lastStatus = string.format("LOCK %d,%d", item.x, item.z)
@@ -1437,9 +1631,10 @@ local function handleMainRadarTouch(x, y)
         return
     end
 
-    -- Center Radar Circle: Click anywhere on the radar disc to aim at those world coordinates!
+    -- Radar Circle tap-to-aim
     local wx, wz = monitorClickToWorld(x, y)
     if wx and wz then
+        sfxClick()
         strikeCfg.targetX = wx
         strikeCfg.targetZ = wz
         strikeCfg.lastStatus = string.format("AIM %d,%d", wx, wz)
@@ -1447,7 +1642,7 @@ local function handleMainRadarTouch(x, y)
 end
 
 --------------------------------------------------------------------------------
--- 10. Computer Terminal UI (Keyboard Control & Encryption Key Setup)
+-- 11. Computer Terminal UI
 --------------------------------------------------------------------------------
 local function drawComputerTerminal()
     term.setBackgroundColor(colors.black)
@@ -1456,27 +1651,30 @@ local function drawComputerTerminal()
     term.setTextColor(colors.lime)
     print("=== ECLIPSE RADAR + CIWS + STRIKE SERVER ===")
     term.setTextColor(colors.lightGray)
-    print(string.format("Monitor: %s (%dx%d) | Wireless Ch: %s",
-        MONITOR_NAME, W, H, modem and tostring(CHANNEL) or "NONE"))
-    print(string.format("Encryption Key: [%s] (Press [K] to change)", SECRET_KEY))
+    print(string.format("Radar Mon: %s (%dx%d) | Keypad Mon: %s",
+        monName, W, H, keyMonName or "NONE"))
+    print(string.format("Speaker  : %s | Key: [%s]",
+        speaker and (soundEnabled and "ON" or "MUTED") or "NONE", SECRET_KEY))
     print("---------------------------------------------")
+    term.setTextColor(defenseEnabled and colors.lime or colors.red)
+    print("Air Defense : " .. (defenseEnabled and "ENABLED (AUTO)" or "DISABLED (HOLD_FIRE)"))
     term.setTextColor(colors.white)
-    print(string.format("Target XYZ : %d, %d, %d", strikeCfg.targetX, strikeCfg.targetY, strikeCfg.targetZ))
-    print(string.format("Count/Sprd : %d missiles | %dm spread | Mode: %s",
+    print(string.format("Target XYZ  : %d, %d, %d", strikeCfg.targetX, strikeCfg.targetY, strikeCfg.targetZ))
+    print(string.format("Count/Sprd  : %d missiles | %dm spread | Mode: %s",
         strikeCfg.count, strikeCfg.spread, FIRE_MODES[strikeCfg.modeIdx]))
-    print(string.format("Inventory  : %d Ready Missiles (%d Floor) | %d CIWS",
+    print(string.format("Inventory   : %d Ready Missiles (%d Floor) | %d CIWS",
         state.readyMissiles, state.placedCount, state.readyCiws))
     print("---------------------------------------------")
     term.setTextColor(colors.cyan)
-    print("[X/Y/Z] Set Coords   [C] Count   [S] Spread")
-    print("[M] Mode   [R] Scan & Register Rockets (64m)")
-    print("[G] Register Rocket at XYZ   [F] LAUNCH STRIKE")
+    print("[1/2/3] Switch Main Screen  [D] Toggle Defense")
+    print("[X/Y/Z] Coords  [C] Count  [S] Spread  [M] Mode")
+    print("[R] Link Rockets (64m)  [K] Key  [F] LAUNCH")
     term.setTextColor(colors.yellow)
     print("\nLast Status: " .. tostring(strikeCfg.lastStatus))
 end
 
 local function promptTerminalLine(promptText)
-    term.setCursorPos(1, 15)
+    term.setCursorPos(1, 16)
     term.setBackgroundColor(colors.black)
     term.setTextColor(colors.yellow)
     term.clearLine()
@@ -1488,11 +1686,11 @@ local function promptTerminalLine(promptText)
 end
 
 --------------------------------------------------------------------------------
--- 11. Encrypted Wireless Packet Handler (from pocket_remote.lua)
+-- 12. Encrypted Wireless Packet Handler (from pocket_remote.lua)
 --------------------------------------------------------------------------------
 local function handleModemMessage(replyChannel, wrapper)
     if not modem then return end
-    local msg, err = decryptPacket(wrapper)
+    local msg = decryptPacket(wrapper)
     if not msg then return end
 
     if msg.type == "PING" or msg.type == "STATUS" then
@@ -1514,7 +1712,26 @@ local function handleModemMessage(replyChannel, wrapper)
             status = buildRemoteStatusPayload(),
         }))
         drawComputerTerminal()
+    elseif msg.type == "TOGGLE_DEFENSE" then
+        if type(msg.enabled) == "boolean" then
+            applyDefenseState(msg.enabled, state.originX, state.originZ)
+        else
+            applyDefenseState(not defenseEnabled, state.originX, state.originZ)
+        end
+        sfxDefenseToggle(defenseEnabled)
+        local resMsg = defenseEnabled and "DEFENSE: AUTO ON" or "DEFENSE: DISABLED"
+        strikeCfg.lastStatus = "REMOTE: " .. resMsg
+        pollMcp()
+        modem.transmit(replyChannel, CHANNEL, encryptPacket({
+            type = "FIRE_REPLY",
+            requestId = msg.requestId,
+            ok = true,
+            message = resMsg,
+            status = buildRemoteStatusPayload(),
+        }))
+        drawComputerTerminal()
     elseif msg.type == "SCAN_REGISTER" then
+        sfxClick()
         local ok, resMsg = scanAndRegisterDevices(msg.radius or 64)
         strikeCfg.lastStatus = "REMOTE: " .. tostring(resMsg)
         pollMcp()
@@ -1527,6 +1744,7 @@ local function handleModemMessage(replyChannel, wrapper)
         }))
         drawComputerTerminal()
     elseif msg.type == "REGISTER_XYZ" then
+        sfxClick()
         local rx, ry, rz = tonumber(msg.x), tonumber(msg.y), tonumber(msg.z)
         local okReg, resReg = false, "Invalid XYZ"
         if rx and ry and rz and mcp.registerRocket then
@@ -1548,6 +1766,7 @@ local function handleModemMessage(replyChannel, wrapper)
         }))
         drawComputerTerminal()
     elseif msg.type == "SILO_ARM" then
+        sfxClick()
         local armedCount = 0
         local okSilos, silos = pcall(mcp.getSilos)
         if okSilos and type(silos) == "table" then
@@ -1568,7 +1787,7 @@ local function handleModemMessage(replyChannel, wrapper)
 end
 
 --------------------------------------------------------------------------------
--- 12. Main Concurrent Event + Render Loop
+-- 13. Main Concurrent Event + Render Loop
 --------------------------------------------------------------------------------
 local sweepAngle = math.rad(45)
 local SWEEP_SPEED = math.rad(6)
@@ -1580,7 +1799,7 @@ drawComputerTerminal()
 local frameTimer = os.startTimer(0.05)
 
 while true do
-    local event, p1, p2, p3, p4, p5 = os.pullEvent()
+    local event, p1, p2, p3, p4 = os.pullEvent()
 
     if event == "timer" and p1 == frameTimer then
         local now = os.clock()
@@ -1595,11 +1814,16 @@ while true do
 
         if keyMon then
             local kw, kh = keyMon.getSize()
-            drawStrikeKeypadPanel(keyMon, kw, kh, false)
+            drawKeypadDeck(keyMon, kw, kh, false)
         end
 
         if state.online then
+            local prevAngle = sweepAngle
             sweepAngle = (sweepAngle + SWEEP_SPEED) % TWO_PI
+            -- Subtle sonar ping each time the sweep passes North (0 rad)
+            if sweepAngle < prevAngle then
+                sfxPing(state.threatCount > 0)
+            end
         end
         frameTimer = os.startTimer(0.05)
 
@@ -1607,11 +1831,16 @@ while true do
         local side, tx, ty = p1, p2, p3
         if keyMonName and side == keyMonName then
             local kw, kh = keyMon.getSize()
-            handleKeypadMonitorTouch(kw, kh, tx, ty, false)
-            drawStrikeKeypadPanel(keyMon, kw, kh, false)
+            handleKeypadTouch(kw, kh, tx, ty, false)
+            drawKeypadDeck(keyMon, kw, kh, false)
+            drawMainMonitor()
         else
             handleMainRadarTouch(tx, ty)
             drawMainMonitor()
+            if keyMon then
+                local kw, kh = keyMon.getSize()
+                drawKeypadDeck(keyMon, kw, kh, false)
+            end
         end
         drawComputerTerminal()
 
@@ -1621,7 +1850,22 @@ while true do
 
     elseif event == "key" then
         local k = p1
-        if k == keys.x then
+        if k == keys.one then
+            sfxClick(); strikeCfg.mainWindow = "RADAR"; drawComputerTerminal()
+        elseif k == keys.two then
+            sfxClick(); strikeCfg.mainWindow = "STRIKE"; drawComputerTerminal()
+        elseif k == keys.three then
+            sfxClick(); strikeCfg.mainWindow = "DEFENSE"; drawComputerTerminal()
+        elseif k == keys.tab then
+            sfxClick()
+            if strikeCfg.mainWindow == "RADAR" then strikeCfg.mainWindow = "STRIKE"
+            elseif strikeCfg.mainWindow == "STRIKE" then strikeCfg.mainWindow = "DEFENSE"
+            else strikeCfg.mainWindow = "RADAR" end
+            drawComputerTerminal()
+        elseif k == keys.d then
+            toggleDefense()
+            drawComputerTerminal()
+        elseif k == keys.x then
             sleep(0.05)
             local v = tonumber(promptTerminalLine("Enter Target X: "))
             if v then strikeCfg.targetX = floor(v) end
@@ -1652,26 +1896,15 @@ while true do
             drawComputerTerminal()
             frameTimer = os.startTimer(0.05)
         elseif k == keys.m then
+            sfxClick()
             strikeCfg.modeIdx = (strikeCfg.modeIdx % #FIRE_MODES) + 1
             drawComputerTerminal()
         elseif k == keys.r then
+            sfxClick()
             local _, msg = scanAndRegisterDevices(64)
             strikeCfg.lastStatus = msg
             pollMcp()
             drawComputerTerminal()
-        elseif k == keys.g then
-            sleep(0.05)
-            local raw = promptTerminalLine("Register Rocket 'X Y Z': ")
-            local rx, ry, rz = raw:match("(-?%d+)%s+(-?%d+)%s+(-?%d+)")
-            if rx and ry and rz and mcp.registerRocket then
-                local okR, resR = pcall(mcp.registerRocket, tonumber(rx), tonumber(ry), tonumber(rz))
-                if okR and type(resR) == "table" then
-                    strikeCfg.lastStatus = tostring(resR.message)
-                end
-                pollMcp()
-            end
-            drawComputerTerminal()
-            frameTimer = os.startTimer(0.05)
         elseif k == keys.k then
             sleep(0.05)
             local newK = promptTerminalLine("New Secret Key (match on pocket): ")

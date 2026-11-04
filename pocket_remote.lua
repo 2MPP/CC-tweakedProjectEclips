@@ -560,14 +560,16 @@ local function drawUI()
         drawLine(18, "   [ >> FIRE AT AIM << ]  ", colors.white, colors.red)
 
     elseif state.activeTab == 3 then
-        -- WINDOW 3: ROCKET REGISTRATION & ENCRYPTION SETTINGS
-        drawLine(4, "-- ROCKET REGISTRATION ---", colors.green, colors.black)
-        drawLine(5, string.format(" Floor Msls: %d | Total: %d",
-            state.serverStatus.placedCount or 0,
-            state.serverStatus.readyMissiles or 0), colors.white, colors.black)
-
-        drawButton(2, 7,  "[ SCAN & REGISTER (64m) ]", colors.black, colors.lime)
-        drawButton(2, 9,  "[ REGISTER @ TARGET XYZ ]", colors.black, colors.cyan)
+        -- WINDOW 3: ROCKET REGISTRATION, DEFENSE TOGGLE & ENCRYPTION
+        drawLine(4, "-- DEFENSE & LINK CTRL ---", colors.green, colors.black)
+        local defOn = state.serverStatus.defenseEnabled ~= false
+        if defOn then
+            drawButton(2, 5, "[ DEFENSE: AUTO ON (TAP) ]", colors.black, colors.lime)
+        else
+            drawButton(2, 5, "[ DEFENSE: OFF/HOLD(TAP) ]", colors.white, colors.red)
+        end
+        drawButton(2, 7,  "[ SCAN & REGISTER (64m) ]", colors.black, colors.cyan)
+        drawButton(2, 9,  "[ REGISTER @ TARGET XYZ ]", colors.black, colors.lightBlue)
         drawButton(2, 11, "[ REGISTER @ MY GPS XYZ ]", colors.black, colors.orange)
 
         drawLine(13, "-- ENCRYPTION SECURITY ---", colors.green, colors.black)
@@ -725,7 +727,12 @@ while true do
             end
 
         elseif state.activeTab == 3 then
-            if y == 7 then
+            if y == 5 then
+                state.statusMsg = "Toggling Air Defense..."
+                state.statusColor = colors.yellow
+                drawUI()
+                sendEncrypted("TOGGLE_DEFENSE")
+            elseif y == 7 then
                 state.statusMsg = "Scanning 64m for rockets..."
                 state.statusColor = colors.cyan
                 drawUI()
